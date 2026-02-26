@@ -160,25 +160,25 @@ export async function runSwitchboard(
     case 'shopify_lookup': {
       const tenant = getTenantConfig();
       const storeUrl = tenant?.shopify_store_url;
-      const token = SHOPIFY_ACCESS_TOKEN.trim();
-      if (!storeUrl || !token) {
+      const accessToken = SHOPIFY_ACCESS_TOKEN.trim();
+      if (!storeUrl || !accessToken) {
         logger.warn(
-          { hasStoreUrl: Boolean(storeUrl), hasToken: Boolean(token) },
-          'Switchboard: shopify_lookup skipped — store URL or token missing; escalating',
+          { hasStoreUrl: Boolean(storeUrl), hasAccessToken: Boolean(accessToken) },
+          'Switchboard: shopify_lookup skipped — store URL or SHOPIFY_ACCESS_TOKEN missing; escalating',
         );
         const reason = !storeUrl
           ? 'Shopify store URL not configured (copy tenant.json.example to tenant.json or set TENANT_OVERRIDE_SHOPIFY_STORE_URL).'
-          : 'Shopify access token not set (SHOPIFY_ACCESS_TOKEN).';
+          : 'SHOPIFY_ACCESS_TOKEN not set. Parent Web Dashboard must perform OAuth and inject token at container boot.';
         await performEscalation(gmail, thread, {
           scenario: 'system',
           error_details: reason,
-          remediation_steps: 'Configure Shopify or reply manually.',
+          remediation_steps: 'Configure Shopify (Web Dashboard OAuth → inject token) or reply manually.',
         });
         break;
       }
       const lookup = await lookupOrder(
         storeUrl,
-        token,
+        accessToken,
         triage.extracted_order_number,
         triage.extracted_email ?? thread.messages[0]?.from ?? null,
       );

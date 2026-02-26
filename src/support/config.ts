@@ -32,7 +32,7 @@ export const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN || '';
 
 /** For local/testing only: override store URL without tenant.json. */
 export const TENANT_OVERRIDE_SHOPIFY_STORE_URL = process.env.TENANT_OVERRIDE_SHOPIFY_STORE_URL || '';
-/** Shopify Admin API access token (from env; per-tenant in hosted). */
+/** Shopify: pre-negotiated offline access token (shpat_...) injected at boot by parent Web Dashboard after OAuth. No auth in this process. */
 export const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || '';
 
 export interface TenantConfig {

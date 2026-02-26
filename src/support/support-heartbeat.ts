@@ -75,9 +75,11 @@ export async function startSupportHeartbeat(): Promise<void> {
 
   const tenant = getTenantConfig();
   const storeUrl = tenant?.shopify_store_url ?? '(none)';
-  const shopifyEnabled = Boolean(tenant?.shopify_store_url && SHOPIFY_ACCESS_TOKEN);
+  const shopifyEnabled = Boolean(
+    tenant?.shopify_store_url && SHOPIFY_ACCESS_TOKEN,
+  );
   logger.info(
-    `[TENANT] Loaded for store ${storeUrl} | Shopify enabled: ${shopifyEnabled} | Gmail poll: ${HEARTBEAT_INTERVAL_MS}ms`,
+    `[TENANT] Loaded for store ${storeUrl} | Shopify enabled: ${shopifyEnabled} (token injected at boot) | Gmail poll: ${HEARTBEAT_INTERVAL_MS}ms`,
   );
 
   logger.info(

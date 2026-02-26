@@ -1,20 +1,13 @@
 /**
  * Shopify REST Admin API (2026-01) client for order lookup.
- * Requires storeUrl (from tenant config) and accessToken (from env).
+ * Headless worker: uses a pre-negotiated SHOPIFY_ACCESS_TOKEN injected at boot (e.g. by Web Dashboard after OAuth).
+ * No OAuth handshakes, no client_credentials — token is provided by parent infrastructure.
  */
 import { logger } from '../logger.js';
 
 const API_VERSION = '2026-01';
 
-export interface ShopifyOrderLookupResult {
-  success: boolean;
-  order: Record<string, unknown> | null;
-  reason: string;
-  flags: string[];
-  escalation_needed: boolean;
-}
-
-function ensureHttps(storeUrl: string): string {
+function ensureHttpsOrigin(storeUrl: string): string {
   const trimmed = storeUrl.trim();
   if (!trimmed) return trimmed;
   try {
@@ -23,6 +16,14 @@ function ensureHttps(storeUrl: string): string {
   } catch {
     return trimmed;
   }
+}
+
+export interface ShopifyOrderLookupResult {
+  success: boolean;
+  order: Record<string, unknown> | null;
+  reason: string;
+  flags: string[];
+  escalation_needed: boolean;
 }
 
 async function fetchWithRetry(
@@ -72,7 +73,7 @@ function buildOrdersUrl(
   baseUrl: string,
   options: { orderNumber?: string | null; email?: string | null },
 ): string {
-  const origin = ensureHttps(baseUrl);
+  const origin = ensureHttpsOrigin(baseUrl);
   const path = `${origin.replace(/\/$/, '')}/admin/api/${API_VERSION}/orders.json`;
   const params = new URLSearchParams();
   params.set('status', 'any');
@@ -143,7 +144,9 @@ function buildFlags(order: Record<string, unknown>): string[] {
 }
 
 /**
- * Look up order by order number or customer email. Returns result matching shopify-lookup SKILL.md schema.
+ * Look up order by order number or customer email.
+ * Uses pre-injected SHOPIFY_ACCESS_TOKEN (X-Shopify-Access-Token header). No auth negotiation.
+ * Parent web infrastructure (Web Dashboard) performs OAuth and injects the token at container boot.
  */
 export async function lookupOrder(
   storeUrl: string,
@@ -155,7 +158,7 @@ export async function lookupOrder(
     return {
       success: false,
       order: null,
-      reason: 'Shopify store URL or access token missing.',
+      reason: 'Shopify store URL or SHOPIFY_ACCESS_TOKEN missing. Token must be injected at boot by parent infrastructure (Web Dashboard OAuth).',
       flags: [],
       escalation_needed: true,
     };
