@@ -1,0 +1,27 @@
+# Dependencies — installed via npm ci in Dockerfile
+node_modules
+npm-debug.log*
+
+# Build / tooling
+dist
+.git
+.gitignore
+*.md
+!README.md
+
+# Tests and dev
+coverage
+.nyc_output
+*.test.ts
+**/__tests__
+**/*.test.ts
+vitest.config.ts
+
+# Optional local / env (secrets come from compose)
+.env
+.env.*
+!.env.example
+
+# Claude skills / repo tokens (not needed for support runtime)
+.claude
+repo-tokens
