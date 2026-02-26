@@ -1,5 +1,6 @@
 /**
- * Switchboard: route triage result → ignore (archive), escalate (Telegram), shopify_lookup (lookup then reply), auto_reply (kb-reader → reply-generator → send).
+ * Switchboard: route triage result → ignore (archive), escalate (draft + mark handled + Telegram), shopify_lookup, auto_reply.
+ * Escalation = createSmartDraft → markThreadHandled → sendTelegramEscalationAlert (never send live to customer).
  */
 import {
   TELEGRAM_BOT_TOKEN,
@@ -11,37 +12,43 @@ import {
 import { logger } from '../logger.js';
 import type { TriageResult } from './triage.js';
 import type { SupportThread } from './gmail-support.js';
-import { archiveThread, sendReply } from './gmail-support.js';
+import {
+  archiveThread,
+  sendReply,
+  createSmartDraft,
+  markThreadHandled,
+} from './gmail-support.js';
 import { runKbReader, runReplyGenerator } from './auto-reply-pipeline.js';
 import { lookupOrder } from './shopify-client.js';
 import type { gmail_v1 } from 'googleapis';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
-async function sendTelegram(text: string): Promise<boolean> {
+async function sendTelegram(text: string, parseMode: 'Markdown' | undefined = 'Markdown'): Promise<boolean> {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     logger.warn('Telegram env missing, skipping escalation send');
     return false;
   }
   const url = `${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const body: { chat_id: string; text: string; parse_mode?: string } = {
+    chat_id: TELEGRAM_CHAT_ID,
+    text,
+  };
+  if (parseMode) body.parse_mode = parseMode;
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CHAT_ID,
-          text,
-          parse_mode: 'Markdown',
-        }),
+        body: JSON.stringify(body),
       });
       if (res.ok) {
         logger.info('Escalation sent to Telegram');
         return true;
       }
-      const body = await res.text();
-      lastErr = new Error(`Telegram ${res.status}: ${body}`);
+      const resBody = await res.text();
+      lastErr = new Error(`Telegram ${res.status}: ${resBody}`);
       if (res.status === 429 || res.status >= 500) {
         const backoff = [1000, 3000, 8000][attempt] ?? 8000;
         await new Promise((r) => setTimeout(r, backoff));
@@ -56,9 +63,66 @@ async function sendTelegram(text: string): Promise<boolean> {
   return false;
 }
 
-function escapeMarkdown(s: string): string {
-  return s.replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
+/** WOW alert format: plain text with Gmail deep link. */
+async function sendTelegramEscalationAlert(
+  short_reason: string,
+  subject: string,
+  threadId: string,
+): Promise<boolean> {
+  const text = `🚨 ESCALATION REQUIRED\nReason: ${short_reason}\nThread: ${subject}\nDraft prepared in Gmail.\n🔗 Open in Gmail: https://mail.google.com/mail/u/0/#inbox/${threadId}`;
+  return sendTelegram(text, undefined);
 }
+
+export type EscalationOptions =
+  | {
+      scenario: 'system';
+      error_details: string;
+      remediation_steps: string;
+      short_reason?: string;
+    }
+  | {
+      scenario: 'customer';
+      draftBody: string;
+      short_reason: string;
+    };
+
+/**
+ * Terminal state for every escalation: createSmartDraft → markThreadHandled → sendTelegramEscalationAlert.
+ * Call from switchboard and from heartbeat catch. Never sends live to customer.
+ */
+export async function performEscalation(
+  gmail: gmail_v1.Gmail,
+  thread: SupportThread,
+  options: EscalationOptions,
+): Promise<void> {
+  const last = thread.messages.length > 0 ? thread.messages[thread.messages.length - 1] : null;
+  const subject = thread.subject || '(no subject)';
+  const to = last?.from ?? '';
+  const messageId = last?.messageId ?? '';
+
+  const draftBody =
+    options.scenario === 'system'
+      ? `**[INTERNAL ESCALATION NOTE - DO NOT SEND TO CUSTOMER]**\n\nReason: ${options.error_details}\nFix: ${options.remediation_steps}`
+      : options.draftBody;
+
+  const short_reason =
+    options.scenario === 'system'
+      ? (options.short_reason ?? options.error_details)
+      : options.short_reason;
+
+  if (last && messageId && to) {
+    await createSmartDraft(gmail, thread.threadId, messageId, draftBody, subject, to);
+  } else {
+    logger.warn({ threadId: thread.threadId }, 'Escalation: no last message, skipping draft');
+  }
+
+  await markThreadHandled(gmail, thread.threadId);
+  await sendTelegramEscalationAlert(short_reason, subject, thread.threadId);
+  logger.info({ threadId: thread.threadId }, 'Escalation terminal state completed');
+}
+
+const CUSTOMER_PLACEHOLDER_DRAFT =
+  "Thank you for your message. We're looking into this and will get back to you shortly.";
 
 /** Run switchboard: perform action for this thread based on triage result. */
 export async function runSwitchboard(
@@ -66,10 +130,13 @@ export async function runSwitchboard(
   thread: SupportThread,
   triage: TriageResult | null,
 ): Promise<void> {
-  // Invalid triage → escalate per ADAPTER-SPEC
+  // Invalid triage → escalate (draft + mark handled + Telegram)
   if (!triage) {
-    const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** Triage output invalid.\n**Thread:** ${escapeMarkdown(thread.subject)}\n\n*Action: Review manually.*`;
-    await sendTelegram(text);
+    await performEscalation(gmail, thread, {
+      scenario: 'system',
+      error_details: 'Triage output invalid.',
+      remediation_steps: 'Review and reply manually.',
+    });
     return;
   }
 
@@ -81,13 +148,12 @@ export async function runSwitchboard(
 
     case 'escalate': {
       const reason = triage.escalation_reason || triage.reason;
-      const email = triage.extracted_email || thread.messages[0]?.from || '';
-      const shortSummary = thread.messages
-        .map((m) => `${m.from}: ${m.body.slice(0, 150)}...`)
-        .join('\n');
-      const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Customer Sentiment:** ${triage.sentiment}\n**Customer:** ${escapeMarkdown(email)}\n\n**Context Summary:**\n${escapeMarkdown(shortSummary)}\n\n*Action Needed: Review & reply manually.*`;
-      await sendTelegram(text);
-      logger.info({ threadId: thread.threadId }, 'Switchboard: escalated to Telegram');
+      await performEscalation(gmail, thread, {
+        scenario: 'customer',
+        draftBody: CUSTOMER_PLACEHOLDER_DRAFT,
+        short_reason: reason,
+      });
+      logger.info({ threadId: thread.threadId }, 'Switchboard: escalated (draft + handled + Telegram)');
       break;
     }
 
@@ -103,8 +169,11 @@ export async function runSwitchboard(
         const reason = !storeUrl
           ? 'Shopify store URL not configured (copy tenant.json.example to tenant.json or set TENANT_OVERRIDE_SHOPIFY_STORE_URL).'
           : 'Shopify access token not set (SHOPIFY_ACCESS_TOKEN).';
-        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Thread:** ${escapeMarkdown(thread.subject)}\n\n*Action: Configure Shopify or reply manually.*`;
-        await sendTelegram(text);
+        await performEscalation(gmail, thread, {
+          scenario: 'system',
+          error_details: reason,
+          remediation_steps: 'Configure Shopify or reply manually.',
+        });
         break;
       }
       const lookup = await lookupOrder(
@@ -115,12 +184,11 @@ export async function runSwitchboard(
       );
       if (lookup.escalation_needed || !lookup.success) {
         const reason = lookup.reason || 'Shopify lookup failed.';
-        const email = triage.extracted_email || thread.messages[0]?.from || '';
-        const shortSummary = thread.messages
-          .map((m) => `${m.from}: ${m.body.slice(0, 150)}...`)
-          .join('\n');
-        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Customer:** ${escapeMarkdown(email)}\n\n**Context Summary:**\n${escapeMarkdown(shortSummary)}\n\n*Action: Review & reply manually.*`;
-        await sendTelegram(text);
+        await performEscalation(gmail, thread, {
+          scenario: 'customer',
+          draftBody: CUSTOMER_PLACEHOLDER_DRAFT,
+          short_reason: reason,
+        });
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → escalated');
         break;
       }
@@ -138,12 +206,11 @@ export async function runSwitchboard(
       );
       if (escalate || !body.trim()) {
         const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
-        const email = triage.extracted_email || thread.messages[0]?.from || '';
-        const shortSummary = thread.messages
-          .map((m) => `${m.from}: ${m.body.slice(0, 150)}...`)
-          .join('\n');
-        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Customer Sentiment:** ${triage.sentiment}\n**Customer:** ${escapeMarkdown(email)}\n\n**Context Summary:**\n${escapeMarkdown(shortSummary)}\n\n*Action Needed: Review & reply manually.*`;
-        await sendTelegram(text);
+        await performEscalation(gmail, thread, {
+          scenario: 'customer',
+          draftBody: body.trim() || CUSTOMER_PLACEHOLDER_DRAFT,
+          short_reason: reason,
+        });
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → auto_reply escalated (no send)');
         break;
       }
@@ -152,8 +219,11 @@ export async function runSwitchboard(
         await archiveThread(gmail, thread.threadId, true);
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup reply sent from support address');
       } else {
-        const text = `🚨 **SEND FAILED** 🚨\n\n**Thread:** ${escapeMarkdown(thread.subject)}\n**Customer:** ${escapeMarkdown(thread.messages[0]?.from || '')}\n\nGmail send failed. Review and reply manually.`;
-        await sendTelegram(text);
+        await performEscalation(gmail, thread, {
+          scenario: 'system',
+          error_details: 'Gmail send failed.',
+          remediation_steps: 'Review draft and send manually.',
+        });
         logger.error({ threadId: thread.threadId }, 'Switchboard: shopify_lookup send failed → escalated');
       }
       break;
@@ -169,12 +239,11 @@ export async function runSwitchboard(
       );
       if (escalate || !body.trim()) {
         const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
-        const email = triage.extracted_email || thread.messages[0]?.from || '';
-        const shortSummary = thread.messages
-          .map((m) => `${m.from}: ${m.body.slice(0, 150)}...`)
-          .join('\n');
-        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Customer Sentiment:** ${triage.sentiment}\n**Customer:** ${escapeMarkdown(email)}\n\n**Context Summary:**\n${escapeMarkdown(shortSummary)}\n\n*Action Needed: Review & reply manually.*`;
-        await sendTelegram(text);
+        await performEscalation(gmail, thread, {
+          scenario: 'customer',
+          draftBody: body.trim() || CUSTOMER_PLACEHOLDER_DRAFT,
+          short_reason: reason,
+        });
         logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply → escalated (no send)');
         break;
       }
@@ -183,8 +252,11 @@ export async function runSwitchboard(
         await archiveThread(gmail, thread.threadId, true);
         logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply sent from support address');
       } else {
-        const text = `🚨 **SEND FAILED** 🚨\n\n**Thread:** ${escapeMarkdown(thread.subject)}\n**Customer:** ${escapeMarkdown(thread.messages[0]?.from || '')}\n\nGmail send failed. Review and reply manually.`;
-        await sendTelegram(text);
+        await performEscalation(gmail, thread, {
+          scenario: 'system',
+          error_details: 'Gmail send failed.',
+          remediation_steps: 'Review draft and send manually.',
+        });
         logger.error({ threadId: thread.threadId }, 'Switchboard: auto_reply send failed → escalated');
       }
       break;

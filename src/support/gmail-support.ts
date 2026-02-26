@@ -282,3 +282,81 @@ export async function sendReply(
     return false;
   }
 }
+
+/**
+ * Terminal state for escalated threads: remove UNREAD (loop killer), add STARRED (priority).
+ * Do NOT create or apply custom labels.
+ */
+export async function markThreadHandled(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+): Promise<void> {
+  try {
+    await gmail.users.threads.modify({
+      userId: 'me',
+      id: threadId,
+      requestBody: {
+        removeLabelIds: ['UNREAD'],
+        addLabelIds: ['STARRED'],
+      },
+    });
+    logger.info({ threadId }, 'Thread marked handled (unread removed, starred)');
+  } catch (err) {
+    logger.error({ err, threadId }, 'markThreadHandled failed');
+    throw err;
+  }
+}
+
+/**
+ * Create a reply draft in Gmail with proper threading (In-Reply-To, References).
+ * Does NOT send; draft is for merchant to review/send. Raw is base64url-encoded MIME.
+ */
+export async function createSmartDraft(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+  originalMessageId: string,
+  draftBody: string,
+  subject: string,
+  to: string,
+): Promise<boolean> {
+  const inReplyTo =
+    originalMessageId.startsWith('<') ? originalMessageId : `<${originalMessageId}>`;
+  const references = inReplyTo;
+  const subj = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+  let fromEmail: string;
+  try {
+    const profile = await gmail.users.getProfile({ userId: 'me' });
+    fromEmail = profile.data.emailAddress || 'support@autosupportclaw.com';
+  } catch (err) {
+    logger.error({ err }, 'Failed to get From for draft');
+    return false;
+  }
+  const crlf = '\r\n';
+  const mime = [
+    `To: ${to}`,
+    `From: ${fromEmail}`,
+    `Subject: ${subj}`,
+    `In-Reply-To: ${inReplyTo}`,
+    `References: ${references}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    draftBody,
+  ].join(crlf);
+  const raw = Buffer.from(mime, 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  try {
+    await gmail.users.drafts.create({
+      userId: 'me',
+      requestBody: { message: { raw } },
+    });
+    logger.info({ threadId }, 'Escalation draft created');
+    return true;
+  } catch (err) {
+    logger.error({ err, threadId }, 'Failed to create Gmail draft');
+    return false;
+  }
+}

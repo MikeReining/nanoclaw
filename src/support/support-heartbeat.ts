@@ -14,7 +14,7 @@ import { createGmailClient, listUnreadThreadIds, getThread } from './gmail-suppo
 import { logger } from '../logger.js';
 import { getMemorySummary, appendMemoryLog } from './memory.js';
 import { runTriage } from './triage.js';
-import { runSwitchboard } from './switchboard.js';
+import { runSwitchboard, performEscalation } from './switchboard.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -33,13 +33,24 @@ export async function runOneHeartbeatTick(
     const thread = await getThread(gmail, threadId);
     if (!thread || thread.messages.length === 0) continue;
 
-    const triage = await runTriage(thread, memorySummary, GROK_API_KEY);
-    await runSwitchboard(gmail, thread, triage);
+    try {
+      const triage = await runTriage(thread, memorySummary, GROK_API_KEY);
+      await runSwitchboard(gmail, thread, triage);
 
-    const action = triage?.action ?? 'escalate';
-    const entry = `- Thread ${threadId} (${thread.subject}): action=${action}${triage?.escalation_reason ? `; escalation_reason=${triage.escalation_reason}` : ''}`;
-    appendMemoryLog(entry);
-    processed++;
+      const action = triage?.action ?? 'escalate';
+      const entry = `- Thread ${threadId} (${thread.subject}): action=${action}${triage?.escalation_reason ? `; escalation_reason=${triage.escalation_reason}` : ''}`;
+      appendMemoryLog(entry);
+      processed++;
+    } catch (err) {
+      logger.error({ err, threadId }, 'Heartbeat tick error for thread');
+      await performEscalation(gmail, thread, {
+        scenario: 'system',
+        error_details: err instanceof Error ? err.message : String(err),
+        remediation_steps: 'Check logs and reply manually.',
+      });
+      appendMemoryLog(`- Thread ${threadId} (${thread.subject}): action=escalate; escalation_reason=Heartbeat error`);
+      processed++;
+    }
   }
 
   logger.info({ processed, total: threadIds.length }, 'Heartbeat tick completed');
