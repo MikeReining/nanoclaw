@@ -1,15 +1,26 @@
 /**
  * Gmail client for support-triage: OAuth from env (GMAIL_CLIENT_ID, _SECRET, _REFRESH_TOKEN).
  * Lists unread threads, fetches thread content, archives threads.
+ * Outgoing replies: AI markdown draft → HTML (marked) + optional custom-email-footer → text/html (multipart/alternative with text/plain fallback).
  */
+import fs from 'fs';
+import path from 'path';
+
+import { marked } from 'marked';
 import { google, gmail_v1 } from 'googleapis';
 
 import {
+  BRAIN_PATH,
   GMAIL_CLIENT_ID,
   GMAIL_CLIENT_SECRET,
   GMAIL_REFRESH_TOKEN,
 } from './config.js';
 import { logger } from '../logger.js';
+
+const KB_DIR = 'knowledge-base';
+const DEFAULT_PLAIN_FOOTER = '\n\n---\nHandled by AutoSupportClaw — 24/7 autonomous support 🦞';
+const DEFAULT_HTML_FOOTER =
+  '<p style="margin-top:1em;border-top:1px solid #eee;padding-top:0.5em;color:#666;font-size:0.9em;">Handled by AutoSupportClaw — 24/7 autonomous support 🦞</p>';
 
 export interface ThreadMessage {
   from: string;
@@ -53,6 +64,38 @@ function getHeader(
   if (!headers) return '';
   const h = headers.find((x) => x.name?.toLowerCase() === name.toLowerCase());
   return (h?.value as string) || '';
+}
+
+/** Load custom-email-footer: prefer .html, else .md (converted to HTML). Returns { html, plain } for multipart. */
+function loadEmailFooter(): { html: string; plain: string } {
+  const kbRoot = path.join(BRAIN_PATH, KB_DIR);
+  const htmlPath = path.join(kbRoot, 'custom-email-footer.html');
+  const mdPath = path.join(kbRoot, 'custom-email-footer.md');
+  try {
+    if (fs.existsSync(htmlPath)) {
+      const html = fs.readFileSync(htmlPath, 'utf-8').trim();
+      const plain = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      return { html, plain: plain || DEFAULT_PLAIN_FOOTER };
+    }
+    if (fs.existsSync(mdPath)) {
+      const md = fs.readFileSync(mdPath, 'utf-8').trim();
+      if (md.length > 0 && !md.startsWith('<!--')) {
+        const html = marked.parse(md, { async: false }) as string;
+        return { html, plain: md };
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Could not load custom-email-footer, using default');
+  }
+  return { html: DEFAULT_HTML_FOOTER, plain: DEFAULT_PLAIN_FOOTER };
+}
+
+/** Convert AI markdown draft to HTML for the email body. */
+function markdownToHtml(markdown: string): string {
+  const trimmed = markdown.trim();
+  if (!trimmed) return '';
+  const html = marked.parse(trimmed, { async: false }) as string;
+  return html.trim();
 }
 
 export async function createGmailClient(): Promise<gmail_v1.Gmail | null> {
@@ -150,7 +193,7 @@ export async function archiveThread(
 
 /**
  * Send a reply in the given thread from the authenticated support account.
- * Uses thread's last message for To, In-Reply-To, References; subject as Re: <subject>.
+ * Converts the AI's markdown body to HTML, appends the HTML footer, and sends multipart/alternative (plain + html).
  */
 export async function sendReply(
   gmail: gmail_v1.Gmail,
@@ -176,16 +219,47 @@ export async function sendReply(
     return false;
   }
 
+  const footer = loadEmailFooter();
+  const plainBody = body.trim() + footer.plain;
+  const htmlBody =
+    '<div style="font-family: sans-serif; max-width: 640px;">' +
+    markdownToHtml(body) +
+    footer.html +
+    '</div>';
+
+  const boundary = `----=_Part_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const crlf = '\r\n';
+  const plainPart = [
+    `Content-Type: text/plain; charset=utf-8`,
+    `Content-Transfer-Encoding: base64`,
+    '',
+    Buffer.from(plainBody, 'utf-8').toString('base64'),
+  ].join(crlf);
+  const htmlPart = [
+    `Content-Type: text/html; charset=utf-8`,
+    `Content-Transfer-Encoding: base64`,
+    '',
+    Buffer.from(htmlBody, 'utf-8').toString('base64'),
+  ].join(crlf);
+  const multipartBody = [
+    `--${boundary}`,
+    plainPart,
+    `--${boundary}`,
+    htmlPart,
+    `--${boundary}--`,
+  ].join(crlf);
+
   const headers = [
     `To: ${to}`,
     `From: ${fromEmail}`,
     `Subject: ${subject}`,
     `In-Reply-To: ${inReplyTo}`,
     `References: ${references}`,
-    'Content-Type: text/plain; charset=utf-8',
+    `MIME-Version: 1.0`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
     '',
-    body,
-  ].join('\r\n');
+    multipartBody,
+  ].join(crlf);
 
   const raw = Buffer.from(headers, 'utf-8')
     .toString('base64')
