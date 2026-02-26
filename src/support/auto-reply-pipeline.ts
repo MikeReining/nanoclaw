@@ -78,13 +78,14 @@ function extractReplyBody(raw: string): { body: string; escalate: boolean } {
 }
 
 /**
- * Run reply-generator: SOUL + skill + thread + triage + kb content → one reply body or escalate.
+ * Run reply-generator: SOUL + skill + thread + triage + kb content [+ optional Shopify order context] → one reply body or escalate.
  */
 export async function runReplyGenerator(
   thread: SupportThread,
   triage: TriageResult,
   kbContent: string,
   grokApiKey: string,
+  orderContext?: string | null,
 ): Promise<{ body: string; escalate: boolean }> {
   const skillPath = path.join(BRAIN_PATH, 'skills', 'reply-generator', 'SKILL.md');
   let skillContent: string;
@@ -120,6 +121,11 @@ export async function runReplyGenerator(
     2,
   );
 
+  const orderBlock =
+    orderContext?.trim() ?
+      `\n## Shopify order data (use for tracking, status, line items)\n${orderContext}\n`
+    : '';
+
   const userContent = `You are generating a single customer reply. Output ONLY the raw email body (plain text), or state ESCALATE and do not send.
 
 ## Triage JSON
@@ -127,7 +133,7 @@ ${triageJson}
 
 ## Knowledge base content (use exact policy quotes where relevant)
 ${kbContent}
-
+${orderBlock}
 ## Full thread (subject: ${thread.subject})
 ${threadBlob}
 

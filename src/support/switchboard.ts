@@ -1,12 +1,19 @@
 /**
- * Switchboard: route triage result → ignore (archive), escalate (Telegram), shopify_lookup (placeholder), auto_reply (kb-reader → reply-generator → send).
+ * Switchboard: route triage result → ignore (archive), escalate (Telegram), shopify_lookup (lookup then reply), auto_reply (kb-reader → reply-generator → send).
  */
-import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROK_API_KEY } from './config.js';
+import {
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
+  GROK_API_KEY,
+  getTenantConfig,
+  SHOPIFY_ACCESS_TOKEN,
+} from './config.js';
 import { logger } from '../logger.js';
 import type { TriageResult } from './triage.js';
 import type { SupportThread } from './gmail-support.js';
 import { archiveThread, sendReply } from './gmail-support.js';
 import { runKbReader, runReplyGenerator } from './auto-reply-pipeline.js';
+import { lookupOrder } from './shopify-client.js';
 import type { gmail_v1 } from 'googleapis';
 
 const TELEGRAM_API = 'https://api.telegram.org';
@@ -84,12 +91,73 @@ export async function runSwitchboard(
       break;
     }
 
-    case 'shopify_lookup':
-      logger.info(
-        { threadId: thread.threadId, order: triage.extracted_order_number },
-        'Switchboard: shopify_lookup (placeholder — prepare tool call later)',
+    case 'shopify_lookup': {
+      const tenant = getTenantConfig();
+      const storeUrl = tenant?.shopify_store_url;
+      const token = SHOPIFY_ACCESS_TOKEN.trim();
+      if (!storeUrl || !token) {
+        logger.warn(
+          { hasStoreUrl: Boolean(storeUrl), hasToken: Boolean(token) },
+          'Switchboard: shopify_lookup skipped — store URL or token missing; escalating',
+        );
+        const reason = !storeUrl
+          ? 'Shopify store URL not configured (copy tenant.json.example to tenant.json or set TENANT_OVERRIDE_SHOPIFY_STORE_URL).'
+          : 'Shopify access token not set (SHOPIFY_ACCESS_TOKEN).';
+        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Thread:** ${escapeMarkdown(thread.subject)}\n\n*Action: Configure Shopify or reply manually.*`;
+        await sendTelegram(text);
+        break;
+      }
+      const lookup = await lookupOrder(
+        storeUrl,
+        token,
+        triage.extracted_order_number,
+        triage.extracted_email ?? thread.messages[0]?.from ?? null,
       );
+      if (lookup.escalation_needed || !lookup.success) {
+        const reason = lookup.reason || 'Shopify lookup failed.';
+        const email = triage.extracted_email || thread.messages[0]?.from || '';
+        const shortSummary = thread.messages
+          .map((m) => `${m.from}: ${m.body.slice(0, 150)}...`)
+          .join('\n');
+        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Customer:** ${escapeMarkdown(email)}\n\n**Context Summary:**\n${escapeMarkdown(shortSummary)}\n\n*Action: Review & reply manually.*`;
+        await sendTelegram(text);
+        logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → escalated');
+        break;
+      }
+      const kbContent = runKbReader(triage.target_files);
+      const orderContext =
+        lookup.order != null
+          ? JSON.stringify({ success: lookup.success, order: lookup.order, reason: lookup.reason, flags: lookup.flags }, null, 2)
+          : null;
+      const { body, escalate } = await runReplyGenerator(
+        thread,
+        triage,
+        kbContent,
+        GROK_API_KEY,
+        orderContext,
+      );
+      if (escalate || !body.trim()) {
+        const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
+        const email = triage.extracted_email || thread.messages[0]?.from || '';
+        const shortSummary = thread.messages
+          .map((m) => `${m.from}: ${m.body.slice(0, 150)}...`)
+          .join('\n');
+        const text = `🚨 **ESCALATION REQUIRED** 🚨\n\n**Reason:** ${escapeMarkdown(reason)}\n**Customer Sentiment:** ${triage.sentiment}\n**Customer:** ${escapeMarkdown(email)}\n\n**Context Summary:**\n${escapeMarkdown(shortSummary)}\n\n*Action Needed: Review & reply manually.*`;
+        await sendTelegram(text);
+        logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → auto_reply escalated (no send)');
+        break;
+      }
+      const sent = await sendReply(gmail, thread, body);
+      if (sent) {
+        await archiveThread(gmail, thread.threadId, true);
+        logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup reply sent from support address');
+      } else {
+        const text = `🚨 **SEND FAILED** 🚨\n\n**Thread:** ${escapeMarkdown(thread.subject)}\n**Customer:** ${escapeMarkdown(thread.messages[0]?.from || '')}\n\nGmail send failed. Review and reply manually.`;
+        await sendTelegram(text);
+        logger.error({ threadId: thread.threadId }, 'Switchboard: shopify_lookup send failed → escalated');
+      }
       break;
+    }
 
     case 'auto_reply': {
       const kbContent = runKbReader(triage.target_files);

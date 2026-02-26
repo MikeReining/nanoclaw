@@ -2,7 +2,10 @@
  * Support-triage / AutoSupportClaw config.
  * Brain at /app/brain (ro); memory written to /app/data/memory (writable).
  */
+import fs from 'fs';
 import path from 'path';
+
+import { logger } from '../logger.js';
 
 const PROJECT_ROOT = process.cwd();
 
@@ -26,6 +29,63 @@ export const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 export const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID || '';
 export const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET || '';
 export const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN || '';
+
+/** For local/testing only: override store URL without tenant.json. */
+export const TENANT_OVERRIDE_SHOPIFY_STORE_URL = process.env.TENANT_OVERRIDE_SHOPIFY_STORE_URL || '';
+/** Shopify Admin API access token (from env; per-tenant in hosted). */
+export const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || '';
+
+export interface TenantConfig {
+  brand_name?: string;
+  shopify_store_url: string;
+  support_email?: string;
+}
+
+/**
+ * Load tenant config: first check TENANT_OVERRIDE_SHOPIFY_STORE_URL, then brain/tenant.json.
+ * Returns null if no store URL available (log friendly warning).
+ */
+export function getTenantConfig(): TenantConfig | null {
+  if (TENANT_OVERRIDE_SHOPIFY_STORE_URL.trim()) {
+    const url = normalizeStoreUrl(TENANT_OVERRIDE_SHOPIFY_STORE_URL.trim());
+    return { shopify_store_url: url };
+  }
+  const tenantPath = path.join(BRAIN_PATH, 'tenant.json');
+  if (!fs.existsSync(tenantPath)) {
+    logger.warn(
+      'tenant.json not found. Copy brain/tenant.json.example to brain/tenant.json and set shopify_store_url. Shopify lookup disabled.',
+    );
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(tenantPath, 'utf-8');
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    const url = data.shopify_store_url;
+    if (typeof url !== 'string' || !url.trim()) {
+      logger.warn({ tenantPath }, 'tenant.json missing or empty shopify_store_url. Shopify lookup disabled.');
+      return null;
+    }
+    return {
+      brand_name: typeof data.brand_name === 'string' ? data.brand_name : undefined,
+      shopify_store_url: normalizeStoreUrl(url.trim()),
+      support_email: typeof data.support_email === 'string' ? data.support_email : undefined,
+    };
+  } catch (err) {
+    logger.warn({ err, tenantPath }, 'Failed to read or parse tenant.json. Copy tenant.json.example to tenant.json. Shopify lookup disabled.');
+    return null;
+  }
+}
+
+function normalizeStoreUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  try {
+    const u = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
+    return u.origin;
+  } catch {
+    return trimmed;
+  }
+}
 
 export function hasSupportEnv(): boolean {
   return Boolean(

@@ -7,6 +7,8 @@ import {
   GROK_API_KEY,
   HEARTBEAT_INTERVAL_MS,
   BRAIN_PATH,
+  getTenantConfig,
+  SHOPIFY_ACCESS_TOKEN,
 } from './config.js';
 import { createGmailClient, listUnreadThreadIds, getThread } from './gmail-support.js';
 import { logger } from '../logger.js';
@@ -59,6 +61,13 @@ export async function startSupportHeartbeat(): Promise<void> {
     logger.error('Gmail client not available. Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN.');
     process.exit(1);
   }
+
+  const tenant = getTenantConfig();
+  const storeUrl = tenant?.shopify_store_url ?? '(none)';
+  const shopifyEnabled = Boolean(tenant?.shopify_store_url && SHOPIFY_ACCESS_TOKEN);
+  logger.info(
+    `[TENANT] Loaded for store ${storeUrl} | Shopify enabled: ${shopifyEnabled} | Gmail poll: ${HEARTBEAT_INTERVAL_MS}ms`,
+  );
 
   logger.info(
     { intervalMs: HEARTBEAT_INTERVAL_MS },
