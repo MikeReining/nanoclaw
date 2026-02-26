@@ -79,5 +79,9 @@ export async function startSupportHeartbeat(): Promise<void> {
     setTimeout(tick, HEARTBEAT_INTERVAL_MS);
   };
 
-  await tick();
+  // Fire the first tick immediately (no await — lets scheduled ticks run)
+  tick();
+
+  // Keep the Node process alive forever so the scheduled ticks can run
+  await new Promise<never>(() => {});
 }
