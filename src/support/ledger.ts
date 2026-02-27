@@ -28,9 +28,19 @@ function getDb(): Database.Database {
       processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       action TEXT,
       escalation_reason TEXT,
+      test_id TEXT,
+      tags TEXT,
       UNIQUE(tenant_id, gmail_message_id)
     )
   `);
+  // Migration: add test_id and tags if missing (e.g. existing DBs from before this schema).
+  const columns = (db.prepare('PRAGMA table_info(processed_messages)').all() as { name: string }[]).map((r) => r.name);
+  if (!columns.includes('test_id')) {
+    db.exec('ALTER TABLE processed_messages ADD COLUMN test_id TEXT');
+  }
+  if (!columns.includes('tags')) {
+    db.exec('ALTER TABLE processed_messages ADD COLUMN tags TEXT');
+  }
   logger.info({ dbPath }, 'Message Ledger initialized (WAL mode)');
   return db;
 }
@@ -49,7 +59,7 @@ export function hasProcessed(tenantId: string, messageId: string): boolean {
 }
 
 /**
- * Record that we have processed this message. Idempotent: re-calling updates processed_at, action, escalation_reason.
+ * Record that we have processed this message. Idempotent: re-calling updates processed_at, action, escalation_reason, test_id, tags.
  */
 export function markProcessed(
   tenantId: string,
@@ -57,22 +67,27 @@ export function markProcessed(
   threadId: string,
   action: string,
   escalationReason?: string,
+  options?: { testId?: string; tags?: string },
 ): void {
   if (!messageId || !tenantId || !threadId) return;
   const mid = normalizeMessageId(messageId);
+  const testId = options?.testId ?? null;
+  const tags = options?.tags ?? null;
   getDb()
     .prepare(
       `
-    INSERT INTO processed_messages (tenant_id, gmail_message_id, thread_id, action, escalation_reason)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO processed_messages (tenant_id, gmail_message_id, thread_id, action, escalation_reason, test_id, tags)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(tenant_id, gmail_message_id) DO UPDATE SET
       thread_id = excluded.thread_id,
       processed_at = CURRENT_TIMESTAMP,
       action = excluded.action,
-      escalation_reason = excluded.escalation_reason
+      escalation_reason = excluded.escalation_reason,
+      test_id = excluded.test_id,
+      tags = excluded.tags
   `,
     )
-    .run(tenantId, mid, threadId, action, escalationReason ?? null);
+    .run(tenantId, mid, threadId, action, escalationReason ?? null, testId, tags);
 }
 
 /** Gmail Message-ID can be with or without angle brackets; normalize for consistent storage. */

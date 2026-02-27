@@ -39,6 +39,16 @@ function emailFromFromHeader(from: string): string {
   return from.trim().toLowerCase();
 }
 
+/** Match <!-- test_id: UUID --> in email body; strip it and return [sanitizedBody, testId or null]. */
+function extractAndStripTestId(body: string): { body: string; testId: string | null } {
+  const re = /<!--\s*test_id:\s*([a-f0-9-]+)\s*-->/i;
+  const m = body.match(re);
+  if (!m) return { body, testId: null };
+  const testId = m[1].trim();
+  const sanitized = body.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
+  return { body: sanitized, testId };
+}
+
 /**
  * Run one heartbeat tick. Pass optional signal to abort fetch/LLM calls on timeout.
  * Gmail API (googleapis) does not natively accept AbortSignal; we rely on the 8-minute
@@ -91,10 +101,19 @@ export async function runOneHeartbeatTick(
       continue;
     }
 
+    // E2E test correlation: strip <!-- test_id: UUID --> from body before sending to LLM; persist test_id in Ledger.
+    const latestIdx = thread.messages.length - 1;
+    const latestMsg = thread.messages[latestIdx];
+    const { body: sanitizedBody, testId: extractedTestId } = extractAndStripTestId(latestMsg.body);
+    thread.messages[latestIdx] = { ...latestMsg, body: sanitizedBody };
+
     try {
       const triage = await runTriage(thread, memorySummary, GROK_API_KEY, signal);
       const outcome = await runSwitchboard(gmail, thread, triage, signal);
-      markProcessed(tenantId, messageId, thread.threadId, outcome.action, outcome.escalationReason ?? undefined);
+      markProcessed(tenantId, messageId, thread.threadId, outcome.action, outcome.escalationReason ?? undefined, {
+        testId: extractedTestId ?? undefined,
+        tags: undefined,
+      });
       const entry = `- Thread ${threadId} (${thread.subject}): action=${outcome.action}${outcome.escalationReason ? `; escalation_reason=${outcome.escalationReason}` : ''}`;
       appendMemoryLog(entry);
       processed++;
@@ -105,7 +124,10 @@ export async function runOneHeartbeatTick(
         error_details: err instanceof Error ? err.message : String(err),
         remediation_steps: 'Check logs and reply manually.',
       }, signal);
-      markProcessed(tenantId, messageId, thread.threadId, 'escalated', 'Heartbeat error');
+      markProcessed(tenantId, messageId, thread.threadId, 'escalated', 'Heartbeat error', {
+        testId: extractedTestId ?? undefined,
+        tags: undefined,
+      });
       appendMemoryLog(`- Thread ${threadId} (${thread.subject}): action=escalate; escalation_reason=Heartbeat error`);
       processed++;
     }
