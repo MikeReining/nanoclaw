@@ -23,6 +23,18 @@ const parsed = raw != null ? parseInt(raw, 10) : NaN;
 export const HEARTBEAT_INTERVAL_MS =
   Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_POLL_INTERVAL_MS;
 
+const newerThanDaysRaw = process.env.GMAIL_NEWER_THAN_DAYS;
+const newerThanDaysParsed = newerThanDaysRaw != null ? parseInt(newerThanDaysRaw, 10) : NaN;
+/** Time window for Gmail poll: only threads newer than this many days. Default 1. */
+export const GMAIL_NEWER_THAN_DAYS =
+  Number.isFinite(newerThanDaysParsed) && newerThanDaysParsed >= 1 ? newerThanDaysParsed : 1;
+
+const maxThreadsRaw = process.env.GMAIL_MAX_THREADS_PER_POLL;
+const maxThreadsParsed = maxThreadsRaw != null ? parseInt(maxThreadsRaw, 10) : NaN;
+/** Max threads to consider per heartbeat tick. Default 20. */
+export const GMAIL_MAX_THREADS_PER_POLL =
+  Number.isFinite(maxThreadsParsed) && maxThreadsParsed > 0 ? maxThreadsParsed : 20;
+
 export const GROK_API_KEY = process.env.GROK_API_KEY || '';
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 export const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
@@ -84,6 +96,24 @@ function normalizeStoreUrl(url: string): string {
     return u.origin;
   } catch {
     return trimmed;
+  }
+}
+
+/**
+ * Stable tenant ID for Ledger and multi-tenant readiness. Derived from tenant config; use 'default' when none.
+ */
+export function getTenantId(): string {
+  const tenant = getTenantConfig();
+  if (!tenant?.shopify_store_url) return 'default';
+  try {
+    const u = new URL(
+      tenant.shopify_store_url.startsWith('http')
+        ? tenant.shopify_store_url
+        : `https://${tenant.shopify_store_url}`,
+    );
+    return u.hostname || 'default';
+  } catch {
+    return 'default';
   }
 }
 

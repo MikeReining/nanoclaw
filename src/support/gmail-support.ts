@@ -125,7 +125,7 @@ export async function createGmailClient(): Promise<gmail_v1.Gmail | null> {
   }
 }
 
-/** List unread thread IDs (inbox, primary). */
+/** List unread thread IDs (inbox, primary). Kept for backwards compatibility; prefer listRecentThreadIds for Ledger-based flow. */
 export async function listUnreadThreadIds(
   gmail: gmail_v1.Gmail,
   maxResults = 20,
@@ -133,6 +133,27 @@ export async function listUnreadThreadIds(
   const res = await gmail.users.threads.list({
     userId: 'me',
     q: 'is:unread in:inbox',
+    maxResults,
+  });
+  const threads = res.data.threads || [];
+  return threads.map((t) => t.id!).filter(Boolean);
+}
+
+export interface ListRecentThreadIdsOptions {
+  maxResults?: number;
+  newerThanDays?: number;
+}
+
+/** List recent thread IDs by time (no read/unread). Use with Ledger so we never miss messages the merchant read before the heartbeat. */
+export async function listRecentThreadIds(
+  gmail: gmail_v1.Gmail,
+  options: ListRecentThreadIdsOptions = {},
+): Promise<string[]> {
+  const { maxResults = 20, newerThanDays = 1 } = options;
+  const q = `newer_than:${newerThanDays}d`;
+  const res = await gmail.users.threads.list({
+    userId: 'me',
+    q,
     maxResults,
   });
   const threads = res.data.threads || [];
@@ -176,17 +197,15 @@ export async function getThread(
   return { threadId, subject, messages: out };
 }
 
-/** Archive thread (remove from INBOX) and optionally remove UNREAD. */
+/** Archive thread (remove from INBOX only; do not remove UNREAD — inbox integrity). */
 export async function archiveThread(
   gmail: gmail_v1.Gmail,
   threadId: string,
-  markRead = true,
 ): Promise<void> {
-  const removeLabelIds = ['INBOX', ...(markRead ? ['UNREAD'] : [])];
   await gmail.users.threads.modify({
     userId: 'me',
     id: threadId,
-    requestBody: { removeLabelIds },
+    requestBody: { removeLabelIds: ['INBOX'] },
   });
   logger.info({ threadId }, 'Thread archived');
 }
@@ -284,7 +303,7 @@ export async function sendReply(
 }
 
 /**
- * Terminal state for escalated threads: remove UNREAD (loop killer), add STARRED (priority).
+ * Terminal state for escalated threads: add STARRED only (do NOT remove UNREAD — inbox integrity).
  * Do NOT create or apply custom labels.
  */
 export async function markThreadHandled(
@@ -295,12 +314,9 @@ export async function markThreadHandled(
     await gmail.users.threads.modify({
       userId: 'me',
       id: threadId,
-      requestBody: {
-        removeLabelIds: ['UNREAD'],
-        addLabelIds: ['STARRED'],
-      },
+      requestBody: { addLabelIds: ['STARRED'] },
     });
-    logger.info({ threadId }, 'Thread marked handled (unread removed, starred)');
+    logger.info({ threadId }, 'Thread marked handled (starred)');
   } catch (err) {
     logger.error({ err, threadId }, 'markThreadHandled failed');
     throw err;
@@ -351,7 +367,7 @@ export async function createSmartDraft(
   try {
     await gmail.users.drafts.create({
       userId: 'me',
-      requestBody: { message: { raw } },
+      requestBody: { message: { raw, threadId } },
     });
     logger.info({ threadId }, 'Escalation draft created');
     return true;

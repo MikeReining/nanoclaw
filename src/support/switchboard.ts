@@ -124,12 +124,18 @@ export async function performEscalation(
 const CUSTOMER_PLACEHOLDER_DRAFT =
   "Thank you for your message. We're looking into this and will get back to you shortly.";
 
-/** Run switchboard: perform action for this thread based on triage result. */
+/** Outcome of switchboard for Ledger recording. */
+export interface SwitchboardOutcome {
+  action: 'ignore' | 'auto_reply' | 'shopify_lookup' | 'escalated';
+  escalationReason?: string | null;
+}
+
+/** Run switchboard: perform action for this thread based on triage result. Returns outcome for Ledger. */
 export async function runSwitchboard(
   gmail: gmail_v1.Gmail,
   thread: SupportThread,
   triage: TriageResult | null,
-): Promise<void> {
+): Promise<SwitchboardOutcome> {
   // Invalid triage → escalate (draft + mark handled + Telegram)
   if (!triage) {
     await performEscalation(gmail, thread, {
@@ -137,14 +143,14 @@ export async function runSwitchboard(
       error_details: 'Triage output invalid.',
       remediation_steps: 'Review and reply manually.',
     });
-    return;
+    return { action: 'escalated', escalationReason: 'Triage output invalid.' };
   }
 
   switch (triage.action) {
     case 'ignore':
-      await archiveThread(gmail, thread.threadId, true);
+      await archiveThread(gmail, thread.threadId);
       logger.info({ threadId: thread.threadId }, 'Switchboard: ignored (archived)');
-      break;
+      return { action: 'ignore' };
 
     case 'escalate': {
       const reason = triage.escalation_reason || triage.reason;
@@ -154,7 +160,7 @@ export async function runSwitchboard(
         short_reason: reason,
       });
       logger.info({ threadId: thread.threadId }, 'Switchboard: escalated (draft + handled + Telegram)');
-      break;
+      return { action: 'escalated', escalationReason: reason };
     }
 
     case 'shopify_lookup': {
@@ -174,7 +180,7 @@ export async function runSwitchboard(
           error_details: reason,
           remediation_steps: 'Configure Shopify (Web Dashboard OAuth → inject token) or reply manually.',
         });
-        break;
+        return { action: 'escalated', escalationReason: reason };
       }
       const lookup = await lookupOrder(
         storeUrl,
@@ -190,7 +196,7 @@ export async function runSwitchboard(
           short_reason: reason,
         });
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → escalated');
-        break;
+        return { action: 'escalated', escalationReason: reason };
       }
       const kbContent = runKbReader(triage.target_files);
       const orderContext =
@@ -212,21 +218,21 @@ export async function runSwitchboard(
           short_reason: reason,
         });
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → auto_reply escalated (no send)');
-        break;
+        return { action: 'escalated', escalationReason: reason };
       }
       const sent = await sendReply(gmail, thread, body);
       if (sent) {
-        await archiveThread(gmail, thread.threadId, true);
+        await archiveThread(gmail, thread.threadId);
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup reply sent from support address');
-      } else {
-        await performEscalation(gmail, thread, {
-          scenario: 'system',
-          error_details: 'Gmail send failed.',
-          remediation_steps: 'Review draft and send manually.',
-        });
-        logger.error({ threadId: thread.threadId }, 'Switchboard: shopify_lookup send failed → escalated');
+        return { action: 'shopify_lookup' };
       }
-      break;
+      await performEscalation(gmail, thread, {
+        scenario: 'system',
+        error_details: 'Gmail send failed.',
+        remediation_steps: 'Review draft and send manually.',
+      });
+      logger.error({ threadId: thread.threadId }, 'Switchboard: shopify_lookup send failed → escalated');
+      return { action: 'escalated', escalationReason: 'Gmail send failed.' };
     }
 
     case 'auto_reply': {
@@ -245,21 +251,21 @@ export async function runSwitchboard(
           short_reason: reason,
         });
         logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply → escalated (no send)');
-        break;
+        return { action: 'escalated', escalationReason: reason };
       }
       const sent = await sendReply(gmail, thread, body);
       if (sent) {
-        await archiveThread(gmail, thread.threadId, true);
+        await archiveThread(gmail, thread.threadId);
         logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply sent from support address');
-      } else {
-        await performEscalation(gmail, thread, {
-          scenario: 'system',
-          error_details: 'Gmail send failed.',
-          remediation_steps: 'Review draft and send manually.',
-        });
-        logger.error({ threadId: thread.threadId }, 'Switchboard: auto_reply send failed → escalated');
+        return { action: 'auto_reply' };
       }
-      break;
+      await performEscalation(gmail, thread, {
+        scenario: 'system',
+        error_details: 'Gmail send failed.',
+        remediation_steps: 'Review draft and send manually.',
+      });
+      logger.error({ threadId: thread.threadId }, 'Switchboard: auto_reply send failed → escalated');
+      return { action: 'escalated', escalationReason: 'Gmail send failed.' };
     }
   }
 }

@@ -1,5 +1,6 @@
 /**
- * Support heartbeat: poll Gmail unread → triage each thread → switchboard → log memory.
+ * Support heartbeat: poll Gmail recent (time-based) → Ledger check → triage → switchboard → markProcessed.
+ * Idempotency and "from support" checks ensure we never miss or double-process messages.
  */
 import type { gmail_v1 } from 'googleapis';
 
@@ -8,24 +9,48 @@ import {
   HEARTBEAT_INTERVAL_MS,
   BRAIN_PATH,
   getTenantConfig,
+  getTenantId,
   SHOPIFY_ACCESS_TOKEN,
+  GMAIL_NEWER_THAN_DAYS,
+  GMAIL_MAX_THREADS_PER_POLL,
 } from './config.js';
-import { createGmailClient, listUnreadThreadIds, getThread } from './gmail-support.js';
+import { createGmailClient, listRecentThreadIds, getThread } from './gmail-support.js';
 import { logger } from '../logger.js';
 import { getMemorySummary, appendMemoryLog } from './memory.js';
 import { runTriage } from './triage.js';
 import { runSwitchboard, performEscalation } from './switchboard.js';
+import { hasProcessed, markProcessed } from './ledger.js';
 import fs from 'fs';
 import path from 'path';
+
+/** Extract email address from "From" header (e.g. "Name <u@x.com>" or "u@x.com"). */
+function emailFromFromHeader(from: string): string {
+  const m = from.match(/<([^>]+)>/);
+  if (m) return m[1].trim().toLowerCase();
+  return from.trim().toLowerCase();
+}
 
 export async function runOneHeartbeatTick(
   gmail: gmail_v1.Gmail,
 ): Promise<'ok' | 'no_tick'> {
-  const threadIds = await listUnreadThreadIds(gmail, 20);
+  const threadIds = await listRecentThreadIds(gmail, {
+    newerThanDays: GMAIL_NEWER_THAN_DAYS,
+    maxResults: GMAIL_MAX_THREADS_PER_POLL,
+  });
   if (threadIds.length === 0) {
     return 'no_tick';
   }
 
+  let supportEmail: string;
+  try {
+    const profile = await gmail.users.getProfile({ userId: 'me' });
+    supportEmail = (profile.data.emailAddress || '').trim().toLowerCase();
+  } catch (err) {
+    logger.error({ err }, 'Failed to get Gmail profile for support-email check');
+    return 'no_tick';
+  }
+
+  const tenantId = getTenantId();
   const memorySummary = getMemorySummary();
   let processed = 0;
 
@@ -33,12 +58,29 @@ export async function runOneHeartbeatTick(
     const thread = await getThread(gmail, threadId);
     if (!thread || thread.messages.length === 0) continue;
 
+    const latestMessage = thread.messages[thread.messages.length - 1];
+    const messageId = latestMessage?.messageId?.trim();
+    if (!messageId) {
+      logger.debug({ threadId }, 'Skipping thread: no messageId on latest message');
+      continue;
+    }
+
+    const fromEmail = emailFromFromHeader(latestMessage.from);
+    if (fromEmail && supportEmail && fromEmail === supportEmail) {
+      logger.info({ threadId }, 'Skipping thread: latest message is from support');
+      continue;
+    }
+
+    if (hasProcessed(tenantId, messageId)) {
+      logger.debug({ threadId, messageId }, 'Skipping thread: already processed (Ledger)');
+      continue;
+    }
+
     try {
       const triage = await runTriage(thread, memorySummary, GROK_API_KEY);
-      await runSwitchboard(gmail, thread, triage);
-
-      const action = triage?.action ?? 'escalate';
-      const entry = `- Thread ${threadId} (${thread.subject}): action=${action}${triage?.escalation_reason ? `; escalation_reason=${triage.escalation_reason}` : ''}`;
+      const outcome = await runSwitchboard(gmail, thread, triage);
+      markProcessed(tenantId, messageId, thread.threadId, outcome.action, outcome.escalationReason ?? undefined);
+      const entry = `- Thread ${threadId} (${thread.subject}): action=${outcome.action}${outcome.escalationReason ? `; escalation_reason=${outcome.escalationReason}` : ''}`;
       appendMemoryLog(entry);
       processed++;
     } catch (err) {
@@ -48,13 +90,14 @@ export async function runOneHeartbeatTick(
         error_details: err instanceof Error ? err.message : String(err),
         remediation_steps: 'Check logs and reply manually.',
       });
+      markProcessed(tenantId, messageId, thread.threadId, 'escalated', 'Heartbeat error');
       appendMemoryLog(`- Thread ${threadId} (${thread.subject}): action=escalate; escalation_reason=Heartbeat error`);
       processed++;
     }
   }
 
   logger.info({ processed, total: threadIds.length }, 'Heartbeat tick completed');
-  return 'ok';
+  return processed > 0 ? 'ok' : 'no_tick';
 }
 
 export async function startSupportHeartbeat(): Promise<void> {
@@ -83,15 +126,15 @@ export async function startSupportHeartbeat(): Promise<void> {
   );
 
   logger.info(
-    { intervalMs: HEARTBEAT_INTERVAL_MS },
-    'Support heartbeat started (polling unread Gmail)',
+    { intervalMs: HEARTBEAT_INTERVAL_MS, newerThanDays: GMAIL_NEWER_THAN_DAYS, maxThreads: GMAIL_MAX_THREADS_PER_POLL },
+    'Support heartbeat started (polling recent Gmail, Ledger-based)',
   );
 
   const tick = async () => {
     try {
       const result = await runOneHeartbeatTick(gmail);
       if (result === 'no_tick') {
-        logger.info('HEARTBEAT_OK (no unread threads)');
+        logger.info('HEARTBEAT_OK (no recent threads or all skipped)');
       }
     } catch (err) {
       logger.error({ err }, 'Heartbeat tick error');
