@@ -86,6 +86,7 @@ export async function runReplyGenerator(
   kbContent: string,
   grokApiKey: string,
   orderContext?: string | null,
+  signal?: AbortSignal,
 ): Promise<{ body: string; escalate: boolean }> {
   const skillPath = path.join(BRAIN_PATH, 'skills', 'reply-generator', 'SKILL.md');
   let skillContent: string;
@@ -142,7 +143,7 @@ Generate the reply body now. No explanations; just the email text the customer w
   const systemContent = `${soul}\n\n---\n\n${skillContent}`;
 
   try {
-    const text = await grokComplete(systemContent, userContent, grokApiKey, 1024);
+    const text = await grokComplete(systemContent, userContent, grokApiKey, 1024, signal);
     return extractReplyBody(text);
   } catch (err) {
     logger.error({ err, threadId: thread.threadId }, 'Reply-generator Grok call failed');

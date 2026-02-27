@@ -81,6 +81,7 @@ export async function runTriage(
   thread: SupportThread,
   memorySummary: string,
   grokApiKey: string,
+  signal?: AbortSignal,
 ): Promise<TriageResult | null> {
   const soul = loadFile('SOUL.md');
   const skillPath = path.join(BRAIN_PATH, 'skills', 'support-triage', 'SKILL.md');
@@ -104,7 +105,7 @@ export async function runTriage(
   const systemContent = `${soul}\n\n---\n\n${skillContent}`;
 
   try {
-    const text = await grokComplete(systemContent, userContent, grokApiKey, 1024);
+    const text = await grokComplete(systemContent, userContent, grokApiKey, 1024, signal);
     const result = parseTriageJson(text);
     if (!result) {
       logger.warn({ threadId: thread.threadId }, 'Triage returned invalid JSON → treat as escalate');

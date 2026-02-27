@@ -1,11 +1,12 @@
 # Production-grade image: deps baked in, no npm install at runtime.
 FROM node:22-bookworm-slim
 
-# Build chain for native modules (e.g. better-sqlite3)
+# Build chain for native modules (e.g. better-sqlite3) + curl for HEALTHCHECK
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -17,7 +18,11 @@ RUN npm ci
 # Application code (node_modules excluded via .dockerignore)
 COPY . .
 
-EXPOSE 3000
+EXPOSE 8080
 
-# AutoSupportClaw: support-triage heartbeat
+# AutoSupportClaw: support-triage heartbeat + health server (single process)
 CMD ["npm", "run", "support"]
+
+# Native healthcheck: 200 = healthy, 500 or unreachable = restart
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1

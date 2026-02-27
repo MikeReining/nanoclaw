@@ -35,6 +35,13 @@ const maxThreadsParsed = maxThreadsRaw != null ? parseInt(maxThreadsRaw, 10) : N
 export const GMAIL_MAX_THREADS_PER_POLL =
   Number.isFinite(maxThreadsParsed) && maxThreadsParsed > 0 ? maxThreadsParsed : 20;
 
+const DEFAULT_TICK_TIMEOUT_MS = 480000; // 8 min — bounds each tick so the loop cannot stall
+const tickTimeoutRaw = process.env.HEARTBEAT_TICK_TIMEOUT_MS;
+const tickTimeoutParsed = tickTimeoutRaw != null ? parseInt(tickTimeoutRaw, 10) : NaN;
+/** Per-tick timeout in ms. If a tick exceeds this, it is aborted and the next tick is still scheduled. Default 480000 (8 min). */
+export const HEARTBEAT_TICK_TIMEOUT_MS =
+  Number.isFinite(tickTimeoutParsed) && tickTimeoutParsed > 0 ? tickTimeoutParsed : DEFAULT_TICK_TIMEOUT_MS;
+
 export const GROK_API_KEY = process.env.GROK_API_KEY || '';
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 export const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';

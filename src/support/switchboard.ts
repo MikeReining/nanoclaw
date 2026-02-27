@@ -24,7 +24,11 @@ import type { gmail_v1 } from 'googleapis';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
-async function sendTelegram(text: string, parseMode: 'Markdown' | undefined = 'Markdown'): Promise<boolean> {
+async function sendTelegram(
+  text: string,
+  parseMode: 'Markdown' | undefined = 'Markdown',
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     logger.warn('Telegram env missing, skipping escalation send');
     return false;
@@ -42,6 +46,7 @@ async function sendTelegram(text: string, parseMode: 'Markdown' | undefined = 'M
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal,
       });
       if (res.ok) {
         logger.info('Escalation sent to Telegram');
@@ -68,9 +73,10 @@ async function sendTelegramEscalationAlert(
   short_reason: string,
   subject: string,
   threadId: string,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const text = `🚨 ESCALATION REQUIRED\nReason: ${short_reason}\nThread: ${subject}\nDraft prepared in Gmail.\n🔗 Open in Gmail: https://mail.google.com/mail/u/0/#inbox/${threadId}`;
-  return sendTelegram(text, undefined);
+  return sendTelegram(text, undefined, signal);
 }
 
 export type EscalationOptions =
@@ -94,6 +100,7 @@ export async function performEscalation(
   gmail: gmail_v1.Gmail,
   thread: SupportThread,
   options: EscalationOptions,
+  signal?: AbortSignal,
 ): Promise<void> {
   const last = thread.messages.length > 0 ? thread.messages[thread.messages.length - 1] : null;
   const subject = thread.subject || '(no subject)';
@@ -117,7 +124,7 @@ export async function performEscalation(
   }
 
   await markThreadHandled(gmail, thread.threadId);
-  await sendTelegramEscalationAlert(short_reason, subject, thread.threadId);
+  await sendTelegramEscalationAlert(short_reason, subject, thread.threadId, signal);
   logger.info({ threadId: thread.threadId }, 'Escalation terminal state completed');
 }
 
@@ -135,6 +142,7 @@ export async function runSwitchboard(
   gmail: gmail_v1.Gmail,
   thread: SupportThread,
   triage: TriageResult | null,
+  signal?: AbortSignal,
 ): Promise<SwitchboardOutcome> {
   // Invalid triage → escalate (draft + mark handled + Telegram)
   if (!triage) {
@@ -142,7 +150,7 @@ export async function runSwitchboard(
       scenario: 'system',
       error_details: 'Triage output invalid.',
       remediation_steps: 'Review and reply manually.',
-    });
+    }, signal);
     return { action: 'escalated', escalationReason: 'Triage output invalid.' };
   }
 
@@ -158,7 +166,7 @@ export async function runSwitchboard(
         scenario: 'customer',
         draftBody: CUSTOMER_PLACEHOLDER_DRAFT,
         short_reason: reason,
-      });
+      }, signal);
       logger.info({ threadId: thread.threadId }, 'Switchboard: escalated (draft + handled + Telegram)');
       return { action: 'escalated', escalationReason: reason };
     }
@@ -179,7 +187,7 @@ export async function runSwitchboard(
           scenario: 'system',
           error_details: reason,
           remediation_steps: 'Configure Shopify (Web Dashboard OAuth → inject token) or reply manually.',
-        });
+        }, signal);
         return { action: 'escalated', escalationReason: reason };
       }
       const lookup = await lookupOrder(
@@ -194,7 +202,7 @@ export async function runSwitchboard(
           scenario: 'customer',
           draftBody: CUSTOMER_PLACEHOLDER_DRAFT,
           short_reason: reason,
-        });
+        }, signal);
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → escalated');
         return { action: 'escalated', escalationReason: reason };
       }
@@ -209,6 +217,7 @@ export async function runSwitchboard(
         kbContent,
         GROK_API_KEY,
         orderContext,
+        signal,
       );
       if (escalate || !body.trim()) {
         const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
@@ -216,7 +225,7 @@ export async function runSwitchboard(
           scenario: 'customer',
           draftBody: body.trim() || CUSTOMER_PLACEHOLDER_DRAFT,
           short_reason: reason,
-        });
+        }, signal);
         logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → auto_reply escalated (no send)');
         return { action: 'escalated', escalationReason: reason };
       }
@@ -230,7 +239,7 @@ export async function runSwitchboard(
         scenario: 'system',
         error_details: 'Gmail send failed.',
         remediation_steps: 'Review draft and send manually.',
-      });
+      }, signal);
       logger.error({ threadId: thread.threadId }, 'Switchboard: shopify_lookup send failed → escalated');
       return { action: 'escalated', escalationReason: 'Gmail send failed.' };
     }
@@ -242,6 +251,8 @@ export async function runSwitchboard(
         triage,
         kbContent,
         GROK_API_KEY,
+        undefined,
+        signal,
       );
       if (escalate || !body.trim()) {
         const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
@@ -249,7 +260,7 @@ export async function runSwitchboard(
           scenario: 'customer',
           draftBody: body.trim() || CUSTOMER_PLACEHOLDER_DRAFT,
           short_reason: reason,
-        });
+        }, signal);
         logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply → escalated (no send)');
         return { action: 'escalated', escalationReason: reason };
       }
@@ -263,7 +274,7 @@ export async function runSwitchboard(
         scenario: 'system',
         error_details: 'Gmail send failed.',
         remediation_steps: 'Review draft and send manually.',
-      });
+      }, signal);
       logger.error({ threadId: thread.threadId }, 'Switchboard: auto_reply send failed → escalated');
       return { action: 'escalated', escalationReason: 'Gmail send failed.' };
     }

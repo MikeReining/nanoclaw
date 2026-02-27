@@ -1,12 +1,14 @@
 /**
  * Support heartbeat: poll Gmail recent (time-based) → Ledger check → triage → switchboard → markProcessed.
  * Idempotency and "from support" checks ensure we never miss or double-process messages.
+ * Observability: 8-min tick timeout, admin dead-man's switch ping, lastSuccessfulTickAt for /health.
  */
 import type { gmail_v1 } from 'googleapis';
 
 import {
   GROK_API_KEY,
   HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TICK_TIMEOUT_MS,
   BRAIN_PATH,
   getTenantConfig,
   getTenantId,
@@ -23,6 +25,13 @@ import { hasProcessed, markProcessed } from './ledger.js';
 import fs from 'fs';
 import path from 'path';
 
+/** For /health: last time a tick completed successfully (no timeout, no unhandled throw). null until first success. */
+let lastSuccessfulTickAt: Date | null = null;
+
+export function getLastSuccessfulTickAt(): Date | null {
+  return lastSuccessfulTickAt;
+}
+
 /** Extract email address from "From" header (e.g. "Name <u@x.com>" or "u@x.com"). */
 function emailFromFromHeader(from: string): string {
   const m = from.match(/<([^>]+)>/);
@@ -30,8 +39,14 @@ function emailFromFromHeader(from: string): string {
   return from.trim().toLowerCase();
 }
 
+/**
+ * Run one heartbeat tick. Pass optional signal to abort fetch/LLM calls on timeout.
+ * Gmail API (googleapis) does not natively accept AbortSignal; we rely on the 8-minute
+ * Promise.race in the caller to bound Gmail calls (best-effort abort for network layer).
+ */
 export async function runOneHeartbeatTick(
   gmail: gmail_v1.Gmail,
+  signal?: AbortSignal,
 ): Promise<'ok' | 'no_tick'> {
   const threadIds = await listRecentThreadIds(gmail, {
     newerThanDays: GMAIL_NEWER_THAN_DAYS,
@@ -77,8 +92,8 @@ export async function runOneHeartbeatTick(
     }
 
     try {
-      const triage = await runTriage(thread, memorySummary, GROK_API_KEY);
-      const outcome = await runSwitchboard(gmail, thread, triage);
+      const triage = await runTriage(thread, memorySummary, GROK_API_KEY, signal);
+      const outcome = await runSwitchboard(gmail, thread, triage, signal);
       markProcessed(tenantId, messageId, thread.threadId, outcome.action, outcome.escalationReason ?? undefined);
       const entry = `- Thread ${threadId} (${thread.subject}): action=${outcome.action}${outcome.escalationReason ? `; escalation_reason=${outcome.escalationReason}` : ''}`;
       appendMemoryLog(entry);
@@ -89,7 +104,7 @@ export async function runOneHeartbeatTick(
         scenario: 'system',
         error_details: err instanceof Error ? err.message : String(err),
         remediation_steps: 'Check logs and reply manually.',
-      });
+      }, signal);
       markProcessed(tenantId, messageId, thread.threadId, 'escalated', 'Heartbeat error');
       appendMemoryLog(`- Thread ${threadId} (${thread.subject}): action=escalate; escalation_reason=Heartbeat error`);
       processed++;
@@ -126,27 +141,50 @@ export async function startSupportHeartbeat(): Promise<void> {
   );
 
   logger.info(
-    { intervalMs: HEARTBEAT_INTERVAL_MS, newerThanDays: GMAIL_NEWER_THAN_DAYS, maxThreads: GMAIL_MAX_THREADS_PER_POLL },
+    {
+      intervalMs: HEARTBEAT_INTERVAL_MS,
+      tickTimeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
+      newerThanDays: GMAIL_NEWER_THAN_DAYS,
+      maxThreads: GMAIL_MAX_THREADS_PER_POLL,
+    },
     'Support heartbeat started (polling recent Gmail, Ledger-based)',
   );
 
   const tick = async () => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HEARTBEAT_TICK_TIMEOUT_MS);
     try {
-      const result = await runOneHeartbeatTick(gmail);
+      const result = await Promise.race([
+        runOneHeartbeatTick(gmail, controller.signal),
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener('abort', () => reject(new Error('Heartbeat tick timed out')));
+        }),
+      ]);
+      clearTimeout(timeoutId);
       if (result === 'no_tick') {
         logger.info('HEARTBEAT_OK (no recent threads or all skipped)');
       }
+      const adminUrl = process.env.ADMIN_HEALTHCHECK_URL;
+      if (adminUrl?.trim()) {
+        fetch(adminUrl).catch((err) => logger.warn({ err, url: adminUrl }, 'Admin healthcheck ping failed'));
+      }
+      lastSuccessfulTickAt = new Date();
     } catch (err) {
-      logger.error({ err }, 'Heartbeat tick error');
+      clearTimeout(timeoutId);
+      const timedOut = controller.signal.aborted;
+      if (timedOut) {
+        logger.error({ err }, 'Heartbeat tick timed out; next tick in 10 min');
+      } else {
+        logger.error({ err }, 'Heartbeat tick error');
+      }
+    } finally {
+      const nextMin = Math.round(HEARTBEAT_INTERVAL_MS / 60000);
+      logger.info({ nextPollInMinutes: nextMin }, 'Idle until next poll (agent is running)');
+      setTimeout(tick, HEARTBEAT_INTERVAL_MS);
     }
-    const nextMin = Math.round(HEARTBEAT_INTERVAL_MS / 60000);
-    logger.info({ nextPollInMinutes: nextMin }, 'Idle until next poll (agent is running)');
-    setTimeout(tick, HEARTBEAT_INTERVAL_MS);
   };
 
-  // Fire the first tick immediately (no await — lets scheduled ticks run)
   tick();
 
-  // Keep the Node process alive forever so the scheduled ticks can run
   await new Promise<never>(() => {});
 }

@@ -25,7 +25,11 @@ export async function grokComplete(
   userContent: string,
   apiKey: string,
   maxTokens = 1024,
+  externalSignal?: AbortSignal,
 ): Promise<string> {
+  const signal = externalSignal
+    ? AbortSignal.any([externalSignal, AbortSignal.timeout(120_000)])
+    : AbortSignal.timeout(120_000);
   const res = await fetch(XAI_RESPONSES_URL, {
     method: 'POST',
     headers: {
@@ -41,7 +45,7 @@ export async function grokComplete(
       store: false,
       max_output_tokens: maxTokens,
     }),
-    signal: AbortSignal.timeout(120_000), // 2 min for reasoning model
+    signal,
   });
 
   if (!res.ok) {
