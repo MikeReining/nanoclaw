@@ -22,6 +22,28 @@ const DEFAULT_PLAIN_FOOTER = '\n\n---\nHandled by AutoSupportClaw 🦞';
 const DEFAULT_HTML_FOOTER =
   '<p style="margin-top:1em;border-top:1px solid #eee;padding-top:0.5em;color:#666;font-size:0.9em;">Handled by AutoSupportClaw 🦞</p>';
 
+/** Strip any viral footer the model may have added so only loadEmailFooter() adds it. */
+function stripViralFooterFromBody(body: string): string {
+  const footerPatterns = [
+    /\n\n---\s*\n\s*Handled by AutoSupportClaw\s*🦞\s*$/i,
+    /\n\s*Handled by AutoSupportClaw\s*🦞\s*$/i,
+    /\n\nHandled by AutoSupportClaw\s*🦞\s*$/i,
+  ];
+  let out = body.trim();
+  let changed: boolean;
+  do {
+    changed = false;
+    for (const re of footerPatterns) {
+      const next = out.replace(re, '');
+      if (next !== out) {
+        out = next.trim();
+        changed = true;
+      }
+    }
+  } while (changed);
+  return out;
+}
+
 /**
  * Tenant-scoped cache for escalation label IDs.
  * Key: tenantId, Value: labelId for "🦞 Claw: Escalation"
@@ -296,10 +318,11 @@ export async function sendReply(
   }
 
   const footer = loadEmailFooter();
-  const plainBody = body.trim() + footer.plain;
+  const bodyNoFooter = stripViralFooterFromBody(body);
+  const plainBody = bodyNoFooter + footer.plain;
   const htmlBody =
     '<div style="font-family: sans-serif; max-width: 640px;">' +
-    markdownToHtml(body) +
+    markdownToHtml(bodyNoFooter) +
     footer.html +
     '</div>';
 
