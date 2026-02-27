@@ -26,10 +26,6 @@ import type { gmail_v1 } from 'googleapis';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
-/** Support inbox for Gmail deep links: u/{encodedEmail} routes to correct account regardless of login order. */
-const SUPPORT_EMAIL = process.env.GMAIL_CLIENT_EMAIL || 'support@autosupportclaw.com';
-const ENCODED_SUPPORT_EMAIL = encodeURIComponent(SUPPORT_EMAIL);
-
 async function sendTelegram(
   text: string,
   parseMode: 'Markdown' | undefined = 'Markdown',
@@ -80,7 +76,7 @@ async function sendTelegram(
 
 /**
  * Send escalation alert to Telegram with inline keyboard buttons.
- * Uses email-based Gmail deep links (u/{encodedEmail}) so the correct inbox opens regardless of login order.
+ * Uses standard Gmail URLs (default browser/session routing). Multi-account disclaimer in body.
  * TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID = owner/merchant chat (not the customer).
  */
 async function sendTelegramEscalationAlert(
@@ -98,8 +94,8 @@ async function sendTelegramEscalationAlert(
     return false;
   }
 
-  const urlEncodedLabelLink = `https://mail.google.com/mail/u/${ENCODED_SUPPORT_EMAIL}/#label/%F0%9F%A6%9E%20Claw:%20Escalation`;
-  const urlEncodedThreadLink = `https://mail.google.com/mail/u/${ENCODED_SUPPORT_EMAIL}/#inbox/${threadId}`;
+  const threadLink = `https://mail.google.com/mail/#inbox/${threadId}`;
+  const labelLink = `https://mail.google.com/mail/#label/%F0%9F%A6%9E%20Claw:%20Escalation`;
 
   const snippetSafe = customerSnippet.replace(/`/g, "'").slice(0, 100);
   const snippetDisplay = snippetSafe + (customerSnippet.length > 100 ? '...' : '');
@@ -111,16 +107,18 @@ Reason: ${short_reason}
 Customer: ${customerEmail}
 Snippet: "${snippetDisplay}"
 
-Draft ready in thread.`;
+Draft ready in thread.
+
+_Note: If you have multiple Gmail accounts, links may open your default browser inbox._`;
 
   // Inline keyboard with URL buttons (no raw URLs in message body)
   const keyboard = {
     inline_keyboard: [
       [
-        { text: '🔗 View Draft', url: urlEncodedThreadLink },
+        { text: '🔗 View Draft', url: threadLink },
       ],
       [
-        { text: '🏷️ Open Escalations', url: urlEncodedLabelLink },
+        { text: '🏷️ Open Escalations', url: labelLink },
       ],
     ],
   };
@@ -194,16 +192,18 @@ async function sendTelegramEscalationFallback(
     return false;
   }
 
-  const urlEncodedThreadLink = `https://mail.google.com/mail/u/${ENCODED_SUPPORT_EMAIL}/#inbox/${threadId}`;
+  const threadLink = `https://mail.google.com/mail/#inbox/${threadId}`;
 
   const text = `🚨 Escalation Failed: We encountered a Gmail API error.
 
 Please check your inbox manually for the thread.
 
-Technical details: ${errorDetails}`;
+Technical details: ${errorDetails}
+
+_Note: If you have multiple Gmail accounts, links may open your default browser inbox._`;
 
   const keyboard = {
-    inline_keyboard: [[{ text: '🔗 View Draft', url: urlEncodedThreadLink }]],
+    inline_keyboard: [[{ text: '🔗 View Draft', url: threadLink }]],
   };
 
   const url = `${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
