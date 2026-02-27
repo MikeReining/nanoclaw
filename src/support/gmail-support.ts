@@ -18,9 +18,9 @@ import {
 import { logger } from '../logger.js';
 
 const KB_DIR = 'knowledge-base';
-const DEFAULT_PLAIN_FOOTER = '\n\n---\nHandled by AutoSupportClaw — 24/7 autonomous support 🦞';
+const DEFAULT_PLAIN_FOOTER = '\n\n---\nHandled by AutoSupportClaw 🦞';
 const DEFAULT_HTML_FOOTER =
-  '<p style="margin-top:1em;border-top:1px solid #eee;padding-top:0.5em;color:#666;font-size:0.9em;">Handled by AutoSupportClaw — 24/7 autonomous support 🦞</p>';
+  '<p style="margin-top:1em;border-top:1px solid #eee;padding-top:0.5em;color:#666;font-size:0.9em;">Handled by AutoSupportClaw 🦞</p>';
 
 /**
  * Tenant-scoped cache for escalation label IDs.

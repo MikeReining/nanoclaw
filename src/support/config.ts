@@ -36,15 +36,15 @@ logger.info(
 
 const newerThanDaysRaw = process.env.GMAIL_NEWER_THAN_DAYS;
 const newerThanDaysParsed = newerThanDaysRaw != null ? parseInt(newerThanDaysRaw, 10) : NaN;
-/** Time window for Gmail poll: only threads newer than this many days. Default 1. */
+/** Time window for Gmail poll: only threads newer than this many days. Default 14. */
 export const GMAIL_NEWER_THAN_DAYS =
-  Number.isFinite(newerThanDaysParsed) && newerThanDaysParsed >= 1 ? newerThanDaysParsed : 1;
+  Number.isFinite(newerThanDaysParsed) && newerThanDaysParsed >= 1 ? newerThanDaysParsed : 14;
 
 const maxThreadsRaw = process.env.GMAIL_MAX_THREADS_PER_POLL;
 const maxThreadsParsed = maxThreadsRaw != null ? parseInt(maxThreadsRaw, 10) : NaN;
-/** Max threads to consider per heartbeat tick. Default 20. */
+/** Max threads to consider per heartbeat tick. Default 50. */
 export const GMAIL_MAX_THREADS_PER_POLL =
-  Number.isFinite(maxThreadsParsed) && maxThreadsParsed > 0 ? maxThreadsParsed : 20;
+  Number.isFinite(maxThreadsParsed) && maxThreadsParsed > 0 ? maxThreadsParsed : 50;
 
 const DEFAULT_TICK_TIMEOUT_MS = 480000; // 8 min — bounds each tick so the loop cannot stall
 const tickTimeoutRaw = process.env.HEARTBEAT_TICK_TIMEOUT_MS;
