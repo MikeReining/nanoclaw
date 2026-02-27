@@ -22,6 +22,13 @@ const DEFAULT_PLAIN_FOOTER = '\n\n---\nHandled by AutoSupportClaw — 24/7 auton
 const DEFAULT_HTML_FOOTER =
   '<p style="margin-top:1em;border-top:1px solid #eee;padding-top:0.5em;color:#666;font-size:0.9em;">Handled by AutoSupportClaw — 24/7 autonomous support 🦞</p>';
 
+/**
+ * Tenant-scaped cache for escalation label IDs.
+ * Key: tenantId, Value: labelId for "🚨 AutoSupport Escalation"
+ * In-memory only (reset on restart) - sufficient for v1.
+ */
+const escalationLabelIdCache: Map<string, string> = new Map();
+
 export interface ThreadMessage {
   from: string;
   subject: string;
@@ -34,6 +41,16 @@ export interface SupportThread {
   threadId: string;
   subject: string;
   messages: ThreadMessage[];
+}
+
+/**
+ * Data payload for escalation drafts.
+ * Strictly typed to prevent variable name hallucinations downstream.
+ */
+export interface EscalationData {
+  isConfigError: boolean;
+  reason: string;
+  suggestedReply?: string;
 }
 
 function extractTextBody(
@@ -303,35 +320,40 @@ export async function sendReply(
 }
 
 /**
- * Terminal state for escalated threads: add STARRED only (do NOT remove UNREAD — inbox integrity).
- * Do NOT create or apply custom labels.
+ * Mark a thread as handled: remove UNREAD, add STARRED and the escalation label.
+ * This is the terminal state for escalated threads.
  */
 export async function markThreadHandled(
   gmail: gmail_v1.Gmail,
   threadId: string,
+  labelId: string,
 ): Promise<void> {
   try {
     await gmail.users.threads.modify({
       userId: 'me',
       id: threadId,
-      requestBody: { addLabelIds: ['STARRED'] },
+      requestBody: {
+        removeLabelIds: ['UNREAD'],
+        addLabelIds: ['STARRED', labelId],
+      },
     });
-    logger.info({ threadId }, 'Thread marked handled (starred)');
+    logger.info({ threadId, labelId }, 'Thread marked handled (starred + escalation label)');
   } catch (err) {
-    logger.error({ err, threadId }, 'markThreadHandled failed');
+    logger.error({ err, threadId, labelId }, 'markThreadHandled failed');
     throw err;
   }
 }
 
 /**
  * Create a reply draft in Gmail with proper threading (In-Reply-To, References).
+ * Supports both internal escalation notes and customer-facing suggested replies.
  * Does NOT send; draft is for merchant to review/send. Raw is base64url-encoded MIME.
  */
 export async function createSmartDraft(
   gmail: gmail_v1.Gmail,
   threadId: string,
   originalMessageId: string,
-  draftBody: string,
+  escalationData: EscalationData,
   subject: string,
   to: string,
 ): Promise<boolean> {
@@ -347,6 +369,17 @@ export async function createSmartDraft(
     logger.error({ err }, 'Failed to get From for draft');
     return false;
   }
+
+  // Build body based on escalation type
+  let body: string;
+  if (escalationData.isConfigError) {
+    // Internal escalation note - clearly marked but still threaded for context
+    body = `[INTERNAL ESCALATION NOTE - DO NOT SEND]\n\nReason: ${escalationData.reason}\nFix: ${escalationData.reason}`;
+  } else {
+    // Customer-facing suggested reply
+    body = escalationData.suggestedReply || `[ESCALATION DRAFT]\n\nReason: ${escalationData.reason}\n\nPlease review and customize before sending.`;
+  }
+
   const crlf = '\r\n';
   const mime = [
     `To: ${to}`,
@@ -357,19 +390,21 @@ export async function createSmartDraft(
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=utf-8',
     '',
-    draftBody,
+    body,
   ].join(crlf);
+
   const raw = Buffer.from(mime, 'utf-8')
     .toString('base64')
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
+
   try {
     await gmail.users.drafts.create({
       userId: 'me',
       requestBody: { message: { raw, threadId } },
     });
-    logger.info({ threadId }, 'Escalation draft created');
+    logger.info({ threadId }, 'Escalation draft created with proper threading');
     return true;
   } catch (err) {
     logger.error({ err, threadId }, 'Failed to create Gmail draft');
