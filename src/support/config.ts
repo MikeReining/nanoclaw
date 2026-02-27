@@ -19,9 +19,20 @@ export const SUPPORT_MEMORY_DIR = path.join(DATA_DIR, 'memory');
 const DEFAULT_POLL_INTERVAL_MS = 600000; // 10 min production default
 const raw = process.env.GMAIL_POLL_INTERVAL_MS;
 const parsed = raw != null ? parseInt(raw, 10) : NaN;
-/** Gmail poll interval in ms. Set GMAIL_POLL_INTERVAL_MS in .env (e.g. 15000 for local dev). Invalid/missing → 600000. */
+/** Gmail poll interval in ms. Set GMAIL_POLL_INTERVAL_MS in .env (e.g. 15000 for local dev). Invalid/missing → 600000 (prod) or 15000 (dev). */
 export const HEARTBEAT_INTERVAL_MS =
-  Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_POLL_INTERVAL_MS;
+  Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : (process.env.NODE_ENV === 'development' ? 15000 : 600000);
+
+logger.info(
+  {
+    intervalSeconds: Math.round(HEARTBEAT_INTERVAL_MS / 1000),
+    source: raw != null ? 'env' : 'default',
+    envKey: 'GMAIL_POLL_INTERVAL_MS',
+  },
+  'Gmail poll interval loaded',
+);
 
 const newerThanDaysRaw = process.env.GMAIL_NEWER_THAN_DAYS;
 const newerThanDaysParsed = newerThanDaysRaw != null ? parseInt(newerThanDaysRaw, 10) : NaN;

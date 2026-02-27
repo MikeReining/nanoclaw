@@ -23,8 +23,8 @@ const DEFAULT_HTML_FOOTER =
   '<p style="margin-top:1em;border-top:1px solid #eee;padding-top:0.5em;color:#666;font-size:0.9em;">Handled by AutoSupportClaw — 24/7 autonomous support 🦞</p>';
 
 /**
- * Tenant-scaped cache for escalation label IDs.
- * Key: tenantId, Value: labelId for "🚨 AutoSupport Escalation"
+ * Tenant-scoped cache for escalation label IDs.
+ * Key: tenantId, Value: labelId for "🦞 Claw: Escalation"
  * In-memory only (reset on restart) - sufficient for v1.
  */
 const escalationLabelIdCache: Map<string, string> = new Map();
@@ -227,6 +227,46 @@ export async function archiveThread(
   logger.info({ threadId }, 'Thread archived');
 }
 
+const ESCALATION_LABEL_NAME = '🦞 Claw: Escalation';
+
+/**
+ * Get or create the escalation label for the tenant. Uses in-memory cache per tenantId.
+ * Returns the Gmail label ID to pass to markThreadHandled.
+ */
+export async function getOrCreateEscalationLabel(
+  gmail: gmail_v1.Gmail,
+  tenantId: string,
+): Promise<string | null> {
+  const cached = escalationLabelIdCache.get(tenantId);
+  if (cached) return cached;
+
+  try {
+    const listRes = await gmail.users.labels.list({ userId: 'me' });
+    const existing = (listRes.data.labels || []).find(
+      (l) => l.name === ESCALATION_LABEL_NAME,
+    );
+    if (existing?.id) {
+      escalationLabelIdCache.set(tenantId, existing.id);
+      return existing.id;
+    }
+
+    const createRes = await gmail.users.labels.create({
+      userId: 'me',
+      requestBody: {
+        name: ESCALATION_LABEL_NAME,
+        labelListVisibility: 'labelShow',
+        messageListVisibility: 'show',
+      },
+    });
+    const labelId = createRes.data.id ?? null;
+    if (labelId) escalationLabelIdCache.set(tenantId, labelId);
+    return labelId;
+  } catch (err) {
+    logger.error({ err, tenantId }, 'getOrCreateEscalationLabel failed');
+    return null;
+  }
+}
+
 /**
  * Send a reply in the given thread from the authenticated support account.
  * Converts the AI's markdown body to HTML, appends the HTML footer, and sends multipart/alternative (plain + html).
@@ -320,8 +360,8 @@ export async function sendReply(
 }
 
 /**
- * Mark a thread as handled: remove UNREAD, add STARRED and the escalation label.
- * This is the terminal state for escalated threads.
+ * Mark a thread as handled: add STARRED and the escalation label. Do NOT remove UNREAD —
+ * the Ledger tracks messageId so we won't infinite-loop; support teams rely on bold unread state.
  */
 export async function markThreadHandled(
   gmail: gmail_v1.Gmail,
@@ -333,11 +373,10 @@ export async function markThreadHandled(
       userId: 'me',
       id: threadId,
       requestBody: {
-        removeLabelIds: ['UNREAD'],
         addLabelIds: ['STARRED', labelId],
       },
     });
-    logger.info({ threadId, labelId }, 'Thread marked handled (starred + escalation label)');
+    logger.info({ threadId, labelId }, 'Thread marked handled (starred + escalation label, unread preserved)');
   } catch (err) {
     logger.error({ err, threadId, labelId }, 'markThreadHandled failed');
     throw err;

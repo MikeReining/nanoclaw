@@ -15,6 +15,8 @@ import {
   SHOPIFY_ACCESS_TOKEN,
   GMAIL_NEWER_THAN_DAYS,
   GMAIL_MAX_THREADS_PER_POLL,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
 } from './config.js';
 import { createGmailClient, listRecentThreadIds, getThread } from './gmail-support.js';
 import { logger } from '../logger.js';
@@ -91,7 +93,13 @@ export async function runOneHeartbeatTick(
     }
 
     const fromEmail = emailFromFromHeader(latestMessage.from);
-    if (fromEmail && supportEmail && fromEmail === supportEmail) {
+    
+    // Force-process test emails regardless of "from support" origin
+    const hasTestMarker = latestMessage.body.includes('AUTOCLAW-TEST-ID') || latestMessage.body.includes('test_id:');
+    if (hasTestMarker) {
+      logger.info({ threadId }, 'Test email detected — forcing processing');
+      // fall through to normal processing
+    } else if (fromEmail && supportEmail && fromEmail === supportEmail) {
       logger.info({ threadId }, 'Skipping thread: latest message is from support');
       continue;
     }
@@ -172,6 +180,22 @@ export async function startSupportHeartbeat(): Promise<void> {
     'Support heartbeat started (polling recent Gmail, Ledger-based)',
   );
 
+  const telegramEnabled = Boolean(TELEGRAM_BOT_TOKEN?.trim() && TELEGRAM_CHAT_ID?.trim());
+  if (telegramEnabled) {
+    logger.info(
+      { chatIdLength: TELEGRAM_CHAT_ID!.length },
+      'Telegram escalation alerts: enabled',
+    );
+  } else {
+    const missing = [];
+    if (!TELEGRAM_BOT_TOKEN?.trim()) missing.push('TELEGRAM_BOT_TOKEN');
+    if (!TELEGRAM_CHAT_ID?.trim()) missing.push('TELEGRAM_CHAT_ID');
+    logger.warn(
+      { missing },
+      'Telegram escalation alerts: disabled (set in .env and restart to receive escalation alerts)',
+    );
+  }
+
   const tick = async () => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), HEARTBEAT_TICK_TIMEOUT_MS);
@@ -200,8 +224,12 @@ export async function startSupportHeartbeat(): Promise<void> {
         logger.error({ err }, 'Heartbeat tick error');
       }
     } finally {
-      const nextMin = Math.round(HEARTBEAT_INTERVAL_MS / 60000);
-      logger.info({ nextPollInMinutes: nextMin }, 'Idle until next poll (agent is running)');
+      const intervalSec = Math.round(HEARTBEAT_INTERVAL_MS / 1000);
+      if (intervalSec < 60) {
+        logger.info({ nextPollInSeconds: intervalSec }, 'Idle until next poll (agent is running)');
+      } else {
+        logger.info({ nextPollInMinutes: Math.round(HEARTBEAT_INTERVAL_MS / 60000) }, 'Idle until next poll (agent is running)');
+      }
       setTimeout(tick, HEARTBEAT_INTERVAL_MS);
     }
   };

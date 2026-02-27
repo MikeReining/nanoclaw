@@ -26,6 +26,10 @@ import type { gmail_v1 } from 'googleapis';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
+/** Support inbox for Gmail deep links: u/{encodedEmail} routes to correct account regardless of login order. */
+const SUPPORT_EMAIL = process.env.GMAIL_CLIENT_EMAIL || 'support@autosupportclaw.com';
+const ENCODED_SUPPORT_EMAIL = encodeURIComponent(SUPPORT_EMAIL);
+
 async function sendTelegram(
   text: string,
   parseMode: 'Markdown' | undefined = 'Markdown',
@@ -56,6 +60,10 @@ async function sendTelegram(
       }
       const resBody = await res.text();
       lastErr = new Error(`Telegram ${res.status}: ${resBody}`);
+      logger.warn(
+        { status: res.status, telegramResponseBody: resBody },
+        'Telegram API error (check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID; ensure you started a chat with the bot)',
+      );
       if (res.status === 429 || res.status >= 500) {
         const backoff = [1000, 3000, 8000][attempt] ?? 8000;
         await new Promise((r) => setTimeout(r, backoff));
@@ -72,27 +80,40 @@ async function sendTelegram(
 
 /**
  * Send escalation alert to Telegram with inline keyboard buttons.
- * URL-encoded emoji ensures deep links work reliably.
+ * Uses email-based Gmail deep links (u/{encodedEmail}) so the correct inbox opens regardless of login order.
+ * TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID = owner/merchant chat (not the customer).
  */
 async function sendTelegramEscalationAlert(
   short_reason: string,
   subject: string,
   threadId: string,
+  customerEmail: string,
+  customerSnippet: string,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const urlEncodedLabelLink = 'https://mail.google.com/mail/u/0/#label/%F0%9F%9A%A8%20AutoSupport%20Escalation';
-  const urlEncodedThreadLink = `https://mail.google.com/mail/u/0/#inbox/${threadId}`;
-  
-  const text = `🚨 ESCALATION REQUIRED
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    logger.warn(
+      'Telegram env missing (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID unset), skipping escalation alert — draft still created in Gmail',
+    );
+    return false;
+  }
+
+  const urlEncodedLabelLink = `https://mail.google.com/mail/u/${ENCODED_SUPPORT_EMAIL}/#label/%F0%9F%A6%9E%20Claw:%20Escalation`;
+  const urlEncodedThreadLink = `https://mail.google.com/mail/u/${ENCODED_SUPPORT_EMAIL}/#inbox/${threadId}`;
+
+  const snippetSafe = customerSnippet.replace(/`/g, "'").slice(0, 100);
+  const snippetDisplay = snippetSafe + (customerSnippet.length > 100 ? '...' : '');
+
+  const text = `🔴 ESCALATION REQUIRED
 
 Reason: ${short_reason}
 
-Draft ready in thread.
+Customer: ${customerEmail}
+Snippet: "${snippetDisplay}"
 
-🔗 Open Thread: ${urlEncodedThreadLink}
-🔗 Open Escalations: ${urlEncodedLabelLink}`;
+Draft ready in thread.`;
 
-  // Inline keyboard with URL buttons
+  // Inline keyboard with URL buttons (no raw URLs in message body)
   const keyboard = {
     inline_keyboard: [
       [
@@ -113,7 +134,7 @@ Draft ready in thread.
   } = {
     chat_id: TELEGRAM_CHAT_ID,
     text,
-    parse_mode: 'Markdown',
+    // Plain text so customer snippet and reason don't need Markdown escaping
   };
 
   // Only add keyboard if we have the required Telegram env vars
@@ -136,6 +157,10 @@ Draft ready in thread.
       }
       const resBody = await res.text();
       lastErr = new Error(`Telegram ${res.status}: ${resBody}`);
+      logger.warn(
+        { status: res.status, telegramResponseBody: resBody },
+        'Telegram escalation alert API error (check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID; ensure you started a chat with the bot)',
+      );
       if (res.status === 429 || res.status >= 500) {
         const backoff = [1000, 3000, 8000][attempt] ?? 8000;
         await new Promise((r) => setTimeout(r, backoff));
@@ -146,7 +171,10 @@ Draft ready in thread.
       await new Promise((r) => setTimeout(r, backoff));
     }
   }
-  logger.error({ err: lastErr }, 'Telegram send failed after retries');
+  logger.error(
+    { err: lastErr },
+    'Telegram escalation alert failed after retries — see telegramResponseBody above for API error details',
+  );
   return false;
 }
 
@@ -159,25 +187,35 @@ async function sendTelegramEscalationFallback(
   errorDetails: string,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const urlEncodedThreadLink = `https://mail.google.com/mail/u/0/#inbox/${threadId}`;
-  
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    logger.warn(
+      'Telegram env missing (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID unset), skipping fallback alert',
+    );
+    return false;
+  }
+
+  const urlEncodedThreadLink = `https://mail.google.com/mail/u/${ENCODED_SUPPORT_EMAIL}/#inbox/${threadId}`;
+
   const text = `🚨 Escalation Failed: We encountered a Gmail API error.
 
 Please check your inbox manually for the thread.
 
-Technical details: ${errorDetails}
+Technical details: ${errorDetails}`;
 
-🔗 Open Thread: ${urlEncodedThreadLink}`;
+  const keyboard = {
+    inline_keyboard: [[{ text: '🔗 View Draft', url: urlEncodedThreadLink }]],
+  };
 
   const url = `${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body: {
     chat_id: string;
     text: string;
     parse_mode?: string;
+    reply_markup?: unknown;
   } = {
     chat_id: TELEGRAM_CHAT_ID,
     text,
-    parse_mode: 'Markdown',
+    reply_markup: keyboard,
   };
 
   try {
@@ -187,6 +225,13 @@ Technical details: ${errorDetails}
       body: JSON.stringify(body),
       signal,
     });
+    if (!res.ok) {
+      const resBody = await res.text();
+      logger.warn(
+        { status: res.status, telegramResponseBody: resBody, threadId },
+        'Telegram fallback alert API error',
+      );
+    }
     return res.ok;
   } catch (err) {
     logger.error({ err, threadId }, 'Telegram fallback alert failed');
@@ -271,10 +316,15 @@ export async function performEscalation(
     }
 
     // Step 4: Send Telegram alert with inline keyboard
+    logger.info({ threadId: thread.threadId }, 'Sending escalation alert to Telegram');
+    const customerEmail = last?.from ?? '';
+    const customerSnippet = last?.body ?? '';
     const telegramSuccess = await sendTelegramEscalationAlert(
       short_reason,
       subject,
       thread.threadId,
+      customerEmail,
+      customerSnippet,
       signal,
     );
 
