@@ -12,7 +12,7 @@ import { getMemorySummary } from './memory.js';
 
 export interface TriageResult {
   category: string;
-  action: 'auto_reply' | 'shopify_lookup' | 'escalate' | 'ignore';
+  action: 'auto_reply' | 'shopify_lookup' | 'escalate' | 'no_reply';
   target_files: string[];
   extracted_order_number: string | null;
   extracted_email: string | null;
@@ -43,7 +43,7 @@ function parseTriageJson(raw: string): TriageResult | null {
     const obj = JSON.parse(text) as Record<string, unknown>;
     const action = obj.action as string;
     if (
-      !['auto_reply', 'shopify_lookup', 'escalate', 'ignore'].includes(action)
+      !['auto_reply', 'shopify_lookup', 'escalate', 'no_reply'].includes(action)
     ) {
       logger.warn({ action }, 'Invalid triage action');
       return null;

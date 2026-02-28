@@ -46,12 +46,20 @@ export function runKbReader(targetFiles: string[]): string {
 
 /**
  * Extract the email body from reply-generator model output.
- * Removes <thinking> blocks and markdown/code fences; detects explicit escalation.
+ * Removes <thinking> blocks and markdown/code fences; detects explicit escalation or Holding Reply.
  */
-function extractReplyBody(raw: string): { body: string; escalate: boolean } {
+export function extractReplyBody(raw: string): { body: string; escalate: boolean; holdingReply?: boolean } {
   let text = raw.trim();
   // Remove <thinking>...</thinking> blocks
   text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
+  
+  // Check for Holding Reply format first: ESCALATE_WITH_REPLY: <holding text>
+  // Using [\s\S]+ instead of .+ to match across newlines (JS regex limitation)
+  const holdingReplyMatch = text.match(/^ESCALATE_WITH_REPLY:\s*([\s\S]+)$/i);
+  if (holdingReplyMatch) {
+    return { body: holdingReplyMatch[1].trim(), escalate: true, holdingReply: true };
+  }
+  
   // If model explicitly says to escalate, do not send
   const escalatePhrases = [
     /do not send/i,

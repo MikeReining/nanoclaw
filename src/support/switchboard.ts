@@ -1,6 +1,7 @@
 /**
- * Switchboard: route triage result → ignore (archive), escalate (draft + mark handled + Telegram), shopify_lookup, auto_reply.
- * Escalation = getOrCreateEscalationLabel → createSmartDraft → markThreadHandled → sendTelegramEscalationAlert (never send live to customer).
+ * Switchboard: route triage result → no_reply (label only, no Telegram), escalate (Holding Reply + Telegram), shopify_lookup, auto_reply.
+ * no_reply = apply Claw: NoReply label, leave unread, NO Telegram ping (pure noise).
+ * escalate = send Holding Reply + Telegram escalation (legitimate question KB can't answer).
  */
 import {
   TELEGRAM_BOT_TOKEN,
@@ -14,11 +15,11 @@ import { logger } from '../logger.js';
 import type { TriageResult } from './triage.js';
 import type { SupportThread, EscalationData } from './gmail-support.js';
 import {
-  archiveThread,
   sendReply,
   createSmartDraft,
   markThreadHandled,
   getOrCreateEscalationLabel,
+  applyExclusiveStatusLabel,
 } from './gmail-support.js';
 import { runKbReader, runReplyGenerator } from './auto-reply-pipeline.js';
 import { lookupOrder } from './shopify-client.js';
@@ -95,7 +96,7 @@ async function sendTelegramEscalationAlert(
   }
 
   const threadLink = `https://mail.google.com/mail/#inbox/${threadId}`;
-  const labelLink = `https://mail.google.com/mail/#label/%F0%9F%A6%9E%20Claw:%20Escalation`;
+  const labelLink = `https://mail.google.com/mail/#label/%F0%9F%A6%9E%20Claw:%20Escalated`;
 
   const snippetSafe = customerSnippet.replace(/`/g, "'").slice(0, 100);
   const snippetDisplay = snippetSafe + (customerSnippet.length > 100 ? '...' : '');
@@ -373,7 +374,7 @@ const CUSTOMER_PLACEHOLDER_DRAFT =
 
 /** Outcome of switchboard for Ledger recording. */
 export interface SwitchboardOutcome {
-  action: 'ignore' | 'auto_reply' | 'shopify_lookup' | 'escalated';
+  action: 'no_reply' | 'auto_reply' | 'shopify_lookup' | 'escalated';
   escalationReason?: string | null;
 }
 
@@ -395,23 +396,37 @@ export async function runSwitchboard(
   }
 
   switch (triage.action) {
-    case 'ignore':
-      await archiveThread(gmail, thread.threadId);
-      logger.info({ threadId: thread.threadId }, 'Switchboard: ignored (archived)');
-      return { action: 'ignore' };
+    case 'no_reply':
+      // Pure noise: apply label, leave unread, NO Telegram ping
+      await applyExclusiveStatusLabel(gmail, thread.threadId, 'Claw: NoReply');
+      logger.info({ threadId: thread.threadId }, 'Switchboard: no_reply (noise — no Telegram ping)');
+      return { action: 'no_reply' };
 
     case 'escalate': {
+      // Hold reply: send polite customer-facing message, THEN escalate
       const reason = triage.escalation_reason || triage.reason;
-      await performEscalation(gmail, thread, {
-        scenario: 'customer',
-        escalationData: {
-          isConfigError: false,
-          reason: reason,
-          suggestedReply: CUSTOMER_PLACEHOLDER_DRAFT,
-        },
-        short_reason: reason,
-      }, signal);
-      logger.info({ threadId: thread.threadId }, 'Switchboard: escalated (draft + handled + Telegram)');
+      const holdingReply = "Thanks for reaching out! I don't have the definitive answer on this right now, so I've flagged this for our human team to review. They will follow up with you shortly.";
+      
+      try {
+        const sent = await sendReply(gmail, thread, holdingReply);
+        if (sent) {
+          logger.info({ threadId: thread.threadId }, 'Switchboard: Holding reply sent for escalation');
+        }
+      } catch (err) {
+        logger.error({ err, threadId: thread.threadId }, 'Failed to send holding reply');
+      }
+      
+      await markThreadHandled(gmail, thread.threadId);
+      await sendTelegramEscalationAlert(
+        reason,
+        thread.subject,
+        thread.threadId,
+        thread.messages[0]?.from ?? 'unknown',
+        thread.messages[thread.messages.length - 1]?.body ?? '',
+        signal,
+      );
+      await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
+      logger.info({ threadId: thread.threadId }, 'Switchboard: escalated with Holding Reply + Telegram');
       return { action: 'escalated', escalationReason: reason };
     }
 
@@ -427,11 +442,16 @@ export async function runSwitchboard(
         const reason = !storeUrl
           ? 'Shopify store URL not configured (copy tenant.json.example to tenant.json or set TENANT_OVERRIDE_SHOPIFY_STORE_URL).'
           : 'SHOPIFY_ACCESS_TOKEN not set. Parent Web Dashboard must perform OAuth and inject token at container boot.';
-        await performEscalation(gmail, thread, {
-          scenario: 'system',
-          error_details: reason,
-          remediation_steps: 'Configure Shopify (Web Dashboard OAuth → inject token) or reply manually.',
-        }, signal);
+        await markThreadHandled(gmail, thread.threadId);
+        await sendTelegramEscalationAlert(
+          reason,
+          thread.subject,
+          thread.threadId,
+          thread.messages[0]?.from ?? 'unknown',
+          thread.messages[thread.messages.length - 1]?.body ?? '',
+          signal,
+        );
+        await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
         return { action: 'escalated', escalationReason: reason };
       }
       const lookup = await lookupOrder(
@@ -442,12 +462,16 @@ export async function runSwitchboard(
       );
       if (lookup.escalation_needed || !lookup.success) {
         const reason = lookup.reason || 'Shopify lookup failed.';
-        await performEscalation(gmail, thread, {
-          scenario: 'system',
-          error_details: reason,
-          remediation_steps: 'Review and check Shopify manually.',
-          short_reason: reason,
-        }, signal);
+        await markThreadHandled(gmail, thread.threadId);
+        await sendTelegramEscalationAlert(
+          reason,
+          thread.subject,
+          thread.threadId,
+          thread.messages[0]?.from ?? 'unknown',
+          thread.messages[thread.messages.length - 1]?.body ?? '',
+          signal,
+        );
+        await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
         return { action: 'escalated', escalationReason: reason };
       }
       const kbContent = runKbReader(triage.target_files);
@@ -455,7 +479,7 @@ export async function runSwitchboard(
         lookup.order != null
           ? JSON.stringify({ success: lookup.success, order: lookup.order, reason: lookup.reason, flags: lookup.flags }, null, 2)
           : null;
-      const { body, escalate } = await runReplyGenerator(
+      const { body, escalate, holdingReply } = await runReplyGenerator(
         thread,
         triage,
         kbContent,
@@ -463,38 +487,71 @@ export async function runSwitchboard(
         orderContext,
         signal,
       );
-      if (escalate || !body.trim()) {
-        const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
-        await performEscalation(gmail, thread, {
-          scenario: 'customer',
-          escalationData: {
-            isConfigError: false,
-            reason: reason,
-            suggestedReply: body.trim() || CUSTOMER_PLACEHOLDER_DRAFT,
-          },
-          short_reason: reason,
-        }, signal);
-        logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → auto_reply escalated (no send)');
-        return { action: 'escalated', escalationReason: reason };
+      if (escalate) {
+        if (holdingReply) {
+          // Model sent Holding Reply with ESCALATE_WITH_REPLY prefix
+          // The body variable already has the cleaned Holding Reply text
+          logger.info({ threadId: thread.threadId }, 'Reply-generator sent Holding Reply');
+          
+          // Send the body (which contains the Holding Reply)
+          const sent = await sendReply(gmail, thread, body);
+          if (sent) {
+            logger.info({ threadId: thread.threadId }, 'Holding Reply sent before escalation');
+          }
+          
+          await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
+          
+          await sendTelegramEscalationAlert(
+            triage.escalation_reason || triage.reason || 'KB was silent',
+            thread.subject,
+            thread.threadId,
+            thread.messages[0]?.from ?? 'unknown',
+            thread.messages[thread.messages.length - 1]?.body ?? '',
+            signal,
+          );
+          logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → Holding Reply escalated');
+          return { action: 'escalated', escalationReason: triage.escalation_reason || triage.reason || 'KB was silent' };
+        } else {
+          // Model declined to reply; escalate normally
+          const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
+          await markThreadHandled(gmail, thread.threadId);
+          await sendTelegramEscalationAlert(
+            reason,
+            thread.subject,
+            thread.threadId,
+            thread.messages[0]?.from ?? 'unknown',
+            thread.messages[thread.messages.length - 1]?.body ?? '',
+            signal,
+          );
+          await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
+          logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup → escalated');
+          return { action: 'escalated', escalationReason: reason };
+        }
       }
       const sent = await sendReply(gmail, thread, body);
       if (sent) {
-        await archiveThread(gmail, thread.threadId);
-        logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup reply sent from support address');
+        // State machine: scrub old labels, apply Claw:Replied
+        await applyExclusiveStatusLabel(gmail, thread.threadId, 'Claw: Replied');
+        logger.info({ threadId: thread.threadId }, 'Switchboard: shopify_lookup reply sent (Claw:Replied applied)');
         return { action: 'shopify_lookup' };
       }
-      await performEscalation(gmail, thread, {
-        scenario: 'system',
-        error_details: 'Gmail send failed.',
-        remediation_steps: 'Review draft and send manually.',
-      }, signal);
+      await markThreadHandled(gmail, thread.threadId);
+      await sendTelegramEscalationAlert(
+        'Gmail send failed',
+        thread.subject,
+        thread.threadId,
+        thread.messages[0]?.from ?? 'unknown',
+        thread.messages[thread.messages.length - 1]?.body ?? '',
+        signal,
+      );
+      await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
       logger.error({ threadId: thread.threadId }, 'Switchboard: shopify_lookup send failed → escalated');
       return { action: 'escalated', escalationReason: 'Gmail send failed.' };
     }
 
     case 'auto_reply': {
       const kbContent = runKbReader(triage.target_files);
-      const { body, escalate } = await runReplyGenerator(
+      const { body, escalate, holdingReply } = await runReplyGenerator(
         thread,
         triage,
         kbContent,
@@ -502,31 +559,63 @@ export async function runSwitchboard(
         undefined,
         signal,
       );
-      if (escalate || !body.trim()) {
-        const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
-        await performEscalation(gmail, thread, {
-          scenario: 'customer',
-          escalationData: {
-            isConfigError: false,
-            reason: reason,
-            suggestedReply: body.trim() || CUSTOMER_PLACEHOLDER_DRAFT,
-          },
-          short_reason: reason,
-        }, signal);
-        logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply → escalated (no send)');
-        return { action: 'escalated', escalationReason: reason };
+      if (escalate) {
+        if (holdingReply) {
+          // Model sent Holding Reply with ESCALATE_WITH_REPLY prefix
+          // The body variable already has the cleaned Holding Reply text
+          logger.info({ threadId: thread.threadId }, 'Reply-generator sent Holding Reply');
+          
+          // Send the body (which contains the Holding Reply)
+          const sent = await sendReply(gmail, thread, body);
+          if (sent) {
+            logger.info({ threadId: thread.threadId }, 'Holding Reply sent before escalation');
+          }
+          
+          await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
+          
+          await sendTelegramEscalationAlert(
+            triage.escalation_reason || triage.reason || 'KB was silent',
+            thread.subject,
+            thread.threadId,
+            thread.messages[0]?.from ?? 'unknown',
+            thread.messages[thread.messages.length - 1]?.body ?? '',
+            signal,
+          );
+          logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply → Holding Reply escalated');
+          return { action: 'escalated', escalationReason: triage.escalation_reason || triage.reason || 'KB was silent' };
+        } else {
+          const reason = triage.escalation_reason || triage.reason || 'Reply-generator chose to escalate or returned no body';
+          await markThreadHandled(gmail, thread.threadId);
+          await sendTelegramEscalationAlert(
+            reason,
+            thread.subject,
+            thread.threadId,
+            thread.messages[0]?.from ?? 'unknown',
+            thread.messages[thread.messages.length - 1]?.body ?? '',
+            signal,
+          );
+          await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
+          logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply → escalated');
+          return { action: 'escalated', escalationReason: reason };
+        }
       }
       const sent = await sendReply(gmail, thread, body);
       if (sent) {
-        await archiveThread(gmail, thread.threadId);
-        logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply sent from support address');
+        // State machine: scrub old labels, apply Claw:Replied
+        await applyExclusiveStatusLabel(gmail, thread.threadId, 'Claw: Replied');
+        logger.info({ threadId: thread.threadId }, 'Switchboard: auto_reply sent (Claw:Replied applied)');
         return { action: 'auto_reply' };
       }
-      await performEscalation(gmail, thread, {
-        scenario: 'system',
-        error_details: 'Gmail send failed.',
-        remediation_steps: 'Review draft and send manually.',
-      }, signal);
+      await markThreadHandled(gmail, thread.threadId);
+      await sendTelegramEscalationAlert(
+        'Gmail send failed',
+        thread.subject,
+        thread.threadId,
+        thread.messages[0]?.from ?? 'unknown',
+        thread.messages[thread.messages.length - 1]?.body ?? '',
+        signal,
+      );
+      await applyExclusiveStatusLabel(gmail, thread.threadId, '🦞 Claw: Escalated');
       logger.error({ threadId: thread.threadId }, 'Switchboard: auto_reply send failed → escalated');
       return { action: 'escalated', escalationReason: 'Gmail send failed.' };
     }

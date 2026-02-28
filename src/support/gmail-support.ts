@@ -45,8 +45,22 @@ function stripViralFooterFromBody(body: string): string {
 }
 
 /**
+ * Strip internal system markers from email body before sending to customer.
+ * This is the final safety net before any outbound email.
+ * Removes known internal command prefixes to prevent leakage to customers.
+ */
+export function stripInternalMarkers(body: string): string {
+  let sanitized = body.trim();
+  
+  // Strictly remove our exact internal markers, ignoring case
+  sanitized = sanitized.replace(/^(ESCALATE_WITH_REPLY|HOLDING_REPLY|INTERNAL ESCALATION NOTE(?: - DO NOT SEND)?):\s*/i, '');
+  
+  return sanitized.trim();
+}
+
+/**
  * Tenant-scoped cache for escalation label IDs.
- * Key: tenantId, Value: labelId for "🦞 Claw: Escalation"
+ * Key: tenantId, Value: labelId for "🦞 Claw: Escalated"
  * In-memory only (reset on restart) - sufficient for v1.
  */
 const escalationLabelIdCache: Map<string, string> = new Map();
@@ -249,7 +263,7 @@ export async function archiveThread(
   logger.info({ threadId }, 'Thread archived');
 }
 
-const ESCALATION_LABEL_NAME = '🦞 Claw: Escalation';
+const ESCALATION_LABEL_NAME = '🦞 Claw: Escalated';
 
 /**
  * Get or create the escalation label for the tenant. Uses in-memory cache per tenantId.
@@ -290,6 +304,118 @@ export async function getOrCreateEscalationLabel(
 }
 
 /**
+ * Claw status labels that are mutually exclusive on a single thread.
+ * Escalated gets the 🦞 so it stands out; Replied and NoReply stay plain so they blend in.
+ */
+export const CLAW_STATUS_LABELS = [
+  'Claw: NoReply',
+  'Claw: Replied',
+  '🦞 Claw: Escalated',
+] as const;
+
+/** Legacy names (no space / no emoji) — removed when scrubbing so we don't double-label. */
+const LEGACY_CLAW_LABEL_NAMES = ['Claw:NoReply', 'Claw:Replied', 'Claw:Escalated'];
+
+export type ClawStatusLabel = (typeof CLAW_STATUS_LABELS)[number];
+
+/**
+ * Find or create a Claw status label. Returns the label ID.
+ * Labels are created with default Gmail colors (no color customization via API).
+ */
+export async function getOrCreateClawStatusLabel(
+  gmail: gmail_v1.Gmail,
+  labelName: ClawStatusLabel,
+): Promise<string | null> {
+  try {
+    const listRes = await gmail.users.labels.list({ userId: 'me' });
+    const existing = (listRes.data.labels || []).find(
+      (l) => l.name === labelName,
+    );
+    if (existing?.id) {
+      return existing.id;
+    }
+
+    const createRes = await gmail.users.labels.create({
+      userId: 'me',
+      requestBody: {
+        name: labelName,
+        labelListVisibility: 'labelShow',
+        messageListVisibility: 'show',
+      },
+    });
+    return createRes.data.id ?? null;
+  } catch (err) {
+    logger.error({ err, labelName }, 'getOrCreateClawStatusLabel failed');
+    return null;
+  }
+}
+
+/**
+ * Remove all Claw status labels from a thread.
+ * Used as part of the exclusive label state machine.
+ */
+export async function removeClawStatusLabels(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+): Promise<void> {
+  try {
+    const thread = await gmail.users.threads.get({
+      userId: 'me',
+      id: threadId,
+      format: 'full',
+    });
+    const labels = thread.data.labels || [];
+    
+    for (const label of labels) {
+      const name = label.name as string;
+      if (CLAW_STATUS_LABELS.includes(name as ClawStatusLabel) || LEGACY_CLAW_LABEL_NAMES.includes(name)) {
+        await gmail.users.threads.modify({
+          userId: 'me',
+          id: threadId,
+          requestBody: { removeLabelIds: [label.id] },
+        });
+      }
+    }
+  } catch (err) {
+    logger.error({ err, threadId }, 'removeClawStatusLabels failed');
+  }
+}
+
+/**
+ * Apply a single Claw status label to a thread, ensuring exclusivity.
+ * This function:
+ * 1. Strips all existing Claw status labels
+ * 2. Applies the target label
+ * This maintains a clean state machine where each thread has exactly one status.
+ */
+export async function applyExclusiveStatusLabel(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+  targetLabelName: ClawStatusLabel,
+): Promise<void> {
+  // 1. Remove old claw labels
+  await removeClawStatusLabels(gmail, threadId);
+  
+  // 2. Ensure new label exists
+  const labelId = await getOrCreateClawStatusLabel(gmail, targetLabelName);
+  if (!labelId) {
+    logger.error({ threadId, targetLabelName }, 'Failed to apply exclusive status label');
+    return;
+  }
+  
+  // 3. Apply the new label
+  try {
+    await gmail.users.threads.modify({
+      userId: 'me',
+      id: threadId,
+      requestBody: { addLabelIds: [labelId] },
+    });
+  } catch (err) {
+    logger.error({ err, threadId, targetLabelName }, 'Failed to apply exclusive status label');
+  }
+}
+
+/**
  * Send a reply in the given thread from the authenticated support account.
  * Converts the AI's markdown body to HTML, appends the HTML footer, and sends multipart/alternative (plain + html).
  */
@@ -319,10 +445,23 @@ export async function sendReply(
 
   const footer = loadEmailFooter();
   const bodyNoFooter = stripViralFooterFromBody(body);
-  const plainBody = bodyNoFooter + footer.plain;
+  const cleanBody = stripInternalMarkers(bodyNoFooter);
+  
+  // Hard abort if critical marker somehow survived stripping
+  if (cleanBody.includes('ESCALATE_WITH_REPLY:') || cleanBody.includes('INTERNAL ESCALATION NOTE')) {
+    logger.error({
+      threadId: thread.threadId,
+      bodySample: cleanBody.slice(0, 200),
+    }, 'CRITICAL: Internal marker survived stripping. Aborting send.');
+    
+    // Do not send the email. Let the calling function handle the fallout or escalate manually.
+    return false;
+  }
+
+  const plainBody = cleanBody + footer.plain;
   const htmlBody =
     '<div style="font-family: sans-serif; max-width: 640px;">' +
-    markdownToHtml(bodyNoFooter) +
+    markdownToHtml(cleanBody) +
     footer.html +
     '</div>';
 
