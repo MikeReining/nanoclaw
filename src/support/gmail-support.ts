@@ -65,6 +65,9 @@ export function stripInternalMarkers(body: string): string {
  */
 const escalationLabelIdCache: Map<string, string> = new Map();
 
+/** Tenant-scoped settings cache to avoid repeated DB reads */
+const settingsCache: Map<string, import('./settings.js').TenantSettings> = new Map();
+
 export interface ThreadMessage {
   from: string;
   subject: string;
@@ -418,16 +421,33 @@ export async function applyExclusiveStatusLabel(
 /**
  * Send a reply in the given thread from the authenticated support account.
  * Converts the AI's markdown body to HTML, appends the HTML footer, and sends multipart/alternative (plain + html).
+ * Respects tenant settings for humanizer delay and watermark.
  */
 export async function sendReply(
   gmail: gmail_v1.Gmail,
   thread: SupportThread,
   body: string,
+  settings?: import('./settings.js').TenantSettings,
 ): Promise<boolean> {
   if (thread.messages.length === 0) {
     logger.warn({ threadId: thread.threadId }, 'Cannot send reply: no messages in thread');
     return false;
   }
+
+  // Humanizer Delay: simulate human typing/response time
+  if (settings?.humanizerDelaySeconds && settings.humanizerDelaySeconds > 0) {
+    logger.info(
+      {
+        threadId: thread.threadId,
+        delaySeconds: settings.humanizerDelaySeconds,
+      },
+      'Applying humanizer delay',
+    );
+    await new Promise((resolve) =>
+      setTimeout(resolve, settings.humanizerDelaySeconds * 1000),
+    );
+  }
+
   const last = thread.messages[thread.messages.length - 1];
   const to = last.from;
   const subject = thread.subject.startsWith('Re:') ? thread.subject : `Re: ${thread.subject}`;
@@ -446,23 +466,34 @@ export async function sendReply(
   const footer = loadEmailFooter();
   const bodyNoFooter = stripViralFooterFromBody(body);
   const cleanBody = stripInternalMarkers(bodyNoFooter);
-  
+
   // Hard abort if critical marker somehow survived stripping
-  if (cleanBody.includes('ESCALATE_WITH_REPLY:') || cleanBody.includes('INTERNAL ESCALATION NOTE')) {
+  if (
+    cleanBody.includes('ESCALATE_WITH_REPLY:') ||
+    cleanBody.includes('INTERNAL ESCALATION NOTE')
+  ) {
     logger.error({
       threadId: thread.threadId,
       bodySample: cleanBody.slice(0, 200),
     }, 'CRITICAL: Internal marker survived stripping. Aborting send.');
-    
+
     // Do not send the email. Let the calling function handle the fallout or escalate manually.
     return false;
   }
 
   const plainBody = cleanBody + footer.plain;
+
+  // Watermark logic: append viral footer unless disabled
+  const watermark =
+    settings?.watermarkEnabled === false
+      ? ''
+      : '<br><br><span style="color: gray; font-size: 12px;">Handled by AutoSupportClaw 🦞</span>';
+
   const htmlBody =
     '<div style="font-family: sans-serif; max-width: 640px;">' +
     markdownToHtml(cleanBody) +
     footer.html +
+    watermark +
     '</div>';
 
   const boundary = `----=_Part_${Date.now()}_${Math.random().toString(36).slice(2)}`;

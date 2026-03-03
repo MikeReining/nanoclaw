@@ -23,6 +23,7 @@ import {
 } from './gmail-support.js';
 import { runKbReader, runReplyGenerator } from './auto-reply-pipeline.js';
 import { lookupOrder } from './shopify-client.js';
+import { getTenantSettings } from './settings.js';
 import type { gmail_v1 } from 'googleapis';
 
 const TELEGRAM_API = 'https://api.telegram.org';
@@ -385,6 +386,10 @@ export async function runSwitchboard(
   triage: TriageResult | null,
   signal?: AbortSignal,
 ): Promise<SwitchboardOutcome> {
+  // Load tenant settings for this tick
+  const tenantId = getTenantId();
+  const settings = getTenantSettings(tenantId);
+
   // Invalid triage → escalate (draft + mark handled + Telegram)
   if (!triage) {
     await performEscalation(gmail, thread, {
@@ -393,6 +398,52 @@ export async function runSwitchboard(
       remediation_steps: 'Review and reply manually.',
     }, signal);
     return { action: 'escalated', escalationReason: 'Triage output invalid.' };
+  }
+
+  // Copilot Mode Check: if enabled, draft instead of send for auto_reply
+  if (settings.copilotModeEnabled && triage.action === 'auto_reply') {
+    logger.info({ threadId: thread.threadId }, 'Copilot Mode: creating draft for human review');
+    const tenant = getTenantConfig();
+    const storeUrl = tenant?.shopify_store_url;
+    
+    // Use reply generator to get the bot response
+    const kbContent = runKbReader(triage.target_files);
+    const { body } = await runReplyGenerator(
+      thread,
+      triage,
+      kbContent,
+      GROK_API_KEY,
+      undefined,
+      signal,
+      settings,
+    );
+
+    const escalationData: EscalationData = {
+      isConfigError: false,
+      reason: triage.reason || 'Copilot Mode: awaiting human review',
+      suggestedReply: body,
+    };
+
+    const last = thread.messages[thread.messages.length - 1];
+    if (last) {
+      await createSmartDraft(
+        gmail,
+        thread.threadId,
+        last.messageId || '',
+        escalationData,
+        thread.subject,
+        last.from,
+      );
+      await sendTelegramEscalationAlert(
+        triage.escalation_reason || triage.reason || 'Copilot Mode Draft Created',
+        thread.subject,
+        thread.threadId,
+        last.from,
+        thread.messages[thread.messages.length - 1]?.body ?? '',
+        signal,
+      );
+    }
+    return { action: 'auto_reply', escalationReason: 'Copilot Mode Draft' };
   }
 
   switch (triage.action) {
@@ -407,13 +458,18 @@ export async function runSwitchboard(
       const reason = triage.escalation_reason || triage.reason;
       const holdingReply = "Thanks for reaching out! I don't have the definitive answer on this right now, so I've flagged this for our human team to review. They will follow up with you shortly.";
       
-      try {
-        const sent = await sendReply(gmail, thread, holdingReply);
-        if (sent) {
-          logger.info({ threadId: thread.threadId }, 'Switchboard: Holding reply sent for escalation');
+      // Respect holdingRepliesEnabled setting
+      if (settings.holdingRepliesEnabled) {
+        try {
+          const sent = await sendReply(gmail, thread, holdingReply, settings);
+          if (sent) {
+            logger.info({ threadId: thread.threadId }, 'Switchboard: Holding reply sent for escalation');
+          }
+        } catch (err) {
+          logger.error({ err, threadId: thread.threadId }, 'Failed to send holding reply');
         }
-      } catch (err) {
-        logger.error({ err, threadId: thread.threadId }, 'Failed to send holding reply');
+      } else {
+        logger.info({ threadId: thread.threadId }, 'Holding replies disabled; escalating silently');
       }
       
       await markThreadHandled(gmail, thread.threadId);
@@ -486,6 +542,7 @@ export async function runSwitchboard(
         GROK_API_KEY,
         orderContext,
         signal,
+        settings,
       );
       if (escalate) {
         if (holdingReply) {
@@ -494,7 +551,7 @@ export async function runSwitchboard(
           logger.info({ threadId: thread.threadId }, 'Reply-generator sent Holding Reply');
           
           // Send the body (which contains the Holding Reply)
-          const sent = await sendReply(gmail, thread, body);
+          const sent = await sendReply(gmail, thread, body, settings);
           if (sent) {
             logger.info({ threadId: thread.threadId }, 'Holding Reply sent before escalation');
           }
@@ -528,7 +585,7 @@ export async function runSwitchboard(
           return { action: 'escalated', escalationReason: reason };
         }
       }
-      const sent = await sendReply(gmail, thread, body);
+      const sent = await sendReply(gmail, thread, body, settings);
       if (sent) {
         // State machine: scrub old labels, apply Claw:Replied
         await applyExclusiveStatusLabel(gmail, thread.threadId, 'Claw: Replied');
@@ -558,6 +615,7 @@ export async function runSwitchboard(
         GROK_API_KEY,
         undefined,
         signal,
+        settings,
       );
       if (escalate) {
         if (holdingReply) {
@@ -566,7 +624,7 @@ export async function runSwitchboard(
           logger.info({ threadId: thread.threadId }, 'Reply-generator sent Holding Reply');
           
           // Send the body (which contains the Holding Reply)
-          const sent = await sendReply(gmail, thread, body);
+          const sent = await sendReply(gmail, thread, body, settings);
           if (sent) {
             logger.info({ threadId: thread.threadId }, 'Holding Reply sent before escalation');
           }
@@ -599,7 +657,7 @@ export async function runSwitchboard(
           return { action: 'escalated', escalationReason: reason };
         }
       }
-      const sent = await sendReply(gmail, thread, body);
+      const sent = await sendReply(gmail, thread, body, settings);
       if (sent) {
         // State machine: scrub old labels, apply Claw:Replied
         await applyExclusiveStatusLabel(gmail, thread.threadId, 'Claw: Replied');

@@ -87,6 +87,7 @@ export function extractReplyBody(raw: string): { body: string; escalate: boolean
 
 /**
  * Run reply-generator: SOUL + skill + thread + triage + kb content [+ optional Shopify order context] → one reply body or escalate.
+ * Accepts optional settings to inject persona into system prompt.
  */
 export async function runReplyGenerator(
   thread: SupportThread,
@@ -95,7 +96,8 @@ export async function runReplyGenerator(
   grokApiKey: string,
   orderContext?: string | null,
   signal?: AbortSignal,
-): Promise<{ body: string; escalate: boolean }> {
+  settings?: import('./settings.js').TenantSettings,
+): Promise<{ body: string; escalate: boolean; holdingReply?: boolean }> {
   const skillPath = path.join(BRAIN_PATH, 'skills', 'reply-generator', 'SKILL.md');
   let skillContent: string;
   try {
@@ -107,6 +109,16 @@ export async function runReplyGenerator(
 
   const soulPath = path.join(BRAIN_PATH, 'SOUL.md');
   const soul = fs.readFileSync(soulPath, 'utf-8');
+
+  // Bot Persona injection into system prompt
+  const personaBlock = settings?.botPersona
+    ? `
+
+## Bot Persona
+${settings.botPersona}
+
+Use this tone consistently in all customer-facing responses.`
+    : '';
 
   const threadBlob = thread.messages
     .map(
@@ -148,7 +160,23 @@ ${threadBlob}
 
 Generate the reply body now. No explanations; just the email text the customer will see, or the word ESCALATE if you must escalate.`;
 
-  const systemContent = `${soul}\n\n---\n\n${skillContent}`;
+  // Persona-specific tone instructions based on selected option
+  let personaInstructions = '';
+  if (settings?.botPersona) {
+    switch (settings.botPersona) {
+      case 'Professional & Crisp':
+        personaInstructions = 'Tone: Professional, direct, concise. Get to the point quickly.';
+        break;
+      case 'Warm & Empathetic':
+        personaInstructions = 'Tone: Warm, empathetic, reassuring. Use phrases like "I understand" and "we\'re here to help".';
+        break;
+      case 'Casual':
+        personaInstructions = 'Tone: Friendly, approachable, slightly informal. Use conversational language.';
+        break;
+    }
+  }
+
+  const systemContent = `${soul}\n\n---\n\n${skillContent}${personaInstructions ? `\n\n## Communication Guidelines\n${personaInstructions}` : ''}`;
 
   try {
     const text = await grokComplete(systemContent, userContent, grokApiKey, 1024, signal);

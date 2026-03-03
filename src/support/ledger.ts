@@ -45,6 +45,9 @@ function getDb(): Database.Database {
   return db;
 }
 
+// Re-export settings init to keep a single source of truth
+export { initSettingsTable } from './settings.js';
+
 /**
  * Returns whether we have already processed this message (any terminal action: reply sent, draft created, escalated, ignored).
  */

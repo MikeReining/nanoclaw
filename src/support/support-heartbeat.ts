@@ -23,7 +23,7 @@ import { logger } from '../logger.js';
 import { getMemorySummary, appendMemoryLog } from './memory.js';
 import { runTriage } from './triage.js';
 import { runSwitchboard, performEscalation } from './switchboard.js';
-import { hasProcessed, markProcessed } from './ledger.js';
+import { hasProcessed, markProcessed, initSettingsTable } from './ledger.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -166,6 +166,10 @@ export async function startSupportHeartbeat(): Promise<void> {
   const shopifyEnabled = Boolean(
     tenant?.shopify_store_url && SHOPIFY_ACCESS_TOKEN,
   );
+  
+  // Initialize settings table on heartbeat start
+  initSettingsTable();
+  
   logger.info(
     `[TENANT] Loaded for store ${storeUrl} | Shopify enabled: ${shopifyEnabled} (token injected at boot) | Gmail poll: ${HEARTBEAT_INTERVAL_MS}ms`,
   );

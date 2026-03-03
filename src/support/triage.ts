@@ -35,12 +35,14 @@ function loadFile(relPath: string): string {
 }
 
 function parseTriageJson(raw: string): TriageResult | null {
-  let text = raw.trim();
-  const fence = /^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/m;
-  const m = text.match(fence);
-  if (m) text = m[1].trim();
+  const jsonMatch = raw.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```|(\{[\s\S]*\})/);
+  const cleanJson = jsonMatch ? (jsonMatch[1] || jsonMatch[2]) : raw;
+  const text = cleanJson.trim();
   try {
     const obj = JSON.parse(text) as Record<string, unknown>;
+    if (obj.action === 'ignore') {
+      obj.action = 'no_reply';
+    }
     const action = obj.action as string;
     if (
       !['auto_reply', 'shopify_lookup', 'escalate', 'no_reply'].includes(action)
